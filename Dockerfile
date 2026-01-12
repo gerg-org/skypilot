@@ -136,3 +136,5 @@ RUN cd /skypilot && \
     if [ "$INSTALL_FROM_SOURCE" != "true" ]; then \
         rm -rf /skypilot; \
     fi
+
+    
