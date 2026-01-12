@@ -120,7 +120,7 @@ COPY --from=process-source /skypilot /skypilot
 
 # Install SkyPilot and set up dashboard based on installation method
 # hadolint ignore=DL3003,DL4006
-# shellcheck disable=SC2012
+# shellcheck disable=SC2005,SC2012
 RUN cd /skypilot && \
     if [ "$INSTALL_FROM_SOURCE" = "true" ]; then \
         echo "Installing from source in editable mode" && \
