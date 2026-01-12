@@ -91,11 +91,12 @@ RUN ARCH=$(case "${TARGETARCH:-$(uname -m)}" in \
     rm session-manager-plugin.deb
 
 # Install kubectl based on architecture
-# shellcheck disable=SC2005
 RUN ARCH=${TARGETARCH:-$(case "$(uname -m)" in \
         "x86_64") echo "amd64" ;; \
         "aarch64") echo "arm64" ;; \
-        *) echo "$(uname -m)" ;; \
+        *) \
+            # shellcheck disable=SC2005
+            echo "$(uname -m)" ;; \
     esac)} && \
     curl -LO "https://dl.k8s.io/release/v1.33.5/bin/linux/$ARCH/kubectl" && \
     install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl && \
@@ -120,13 +121,13 @@ COPY --from=process-source /skypilot /skypilot
 
 # Install SkyPilot and set up dashboard based on installation method
 # hadolint ignore=DL3003,DL4006
-# shellcheck disable=SC2005,SC2012
 RUN cd /skypilot && \
     if [ "$INSTALL_FROM_SOURCE" = "true" ]; then \
         echo "Installing from source in editable mode" && \
         ~/.local/bin/uv pip install -e ".[all]" --system; \
     else \
         echo "Installing from wheel file" && \
+        # shellcheck disable=SC2012
         WHEEL_FILE=$(ls dist/*skypilot*.whl 2>/dev/null | head -1) && \
         if [ -z "$WHEEL_FILE" ]; then \
             echo "Error: No wheel file found in /skypilot/dist/" && \
