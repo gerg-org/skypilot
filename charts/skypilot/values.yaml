@@ -548,7 +548,7 @@ securityContext:
 
 # Set the runtime class
 # @schema type: [string, null]
-runtimeClassName: kata-without-host-devices
+# runtimeClassName: kata-without-host-devices
 
 # Set configuration for Prometheus helm chart
 # Refer to https://github.com/prometheus-community/helm-charts/blob/main/charts/prometheus/values.yaml for available values.
