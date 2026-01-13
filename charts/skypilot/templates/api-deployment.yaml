@@ -47,6 +47,7 @@ spec:
         app: {{ .Release.Name }}-api
         # This label indicates that the API server is ready to serve requests.
         skypilot.co/ready: "true"
+        kyverno/allow-run-as-root: "true" # in the g3rg envionment this lets us run as root. TODO make this a values.yaml option
     spec:
       automountServiceAccountToken: {{ .Values.kubernetesCredentials.useApiServerCluster }}
       serviceAccountName: {{ include "skypilot.serviceAccountName" . }}
