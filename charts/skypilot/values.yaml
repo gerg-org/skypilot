@@ -257,7 +257,7 @@ storage:
   # Enable/disable persistent storage
   # With this enabled, SkyPilot will use a PV to persist the internal data like states, logs, lock files, catalog, etc.
   # Refer to https://docs.skypilot.co/en/latest/reference/architecture/state.html for more details.
-  enabled: true
+  enabled: false
   # Storage class name - leave empty to use cluster default
   storageClassName: ""
   # Access modes - ReadWriteOnce or ReadWriteMany depending on what is supported by the storage class
