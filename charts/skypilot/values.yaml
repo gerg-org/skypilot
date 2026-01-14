@@ -10,7 +10,6 @@ global:
   # @schema type: [array, null]; item: object
   extraEnvs: null
 
-
 istio:
   ingress:
     enabled: true
