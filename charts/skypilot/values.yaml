@@ -17,7 +17,6 @@ istio:
     basedomain: basedomain-to-be-replaced-by-pipeline
     prodDNSName: proddomain-to-be-replaced-by-pipeline
     prefix: prefix-to-be-replaced-by-pipeline    
-    exposure: internal   
 
 apiService:
   # Docker image to use for the API server. The default value will be updated by the release pipeline to be consistent with the SkyPilot release or nightly build.

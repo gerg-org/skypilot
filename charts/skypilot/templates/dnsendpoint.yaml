@@ -1,0 +1,11 @@
+apiVersion: externaldns.k8s.io/v1alpha1
+kind: DNSEndpoint
+metadata:
+  name: {{ .Values.istio.ingress.prefix }}{{ .Values.istio.ingress.host }}.{{ .Values.istio.ingress.basedomain }}
+spec:
+  endpoints:
+  - dnsName: {{ .Values.istio.ingress.prefix }}{{ .Values.istio.ingress.host }}.{{ .Values.istio.ingress.basedomain }}
+    recordTTL: 180
+    recordType: CNAME
+    targets:
+    - "istio-ingressgateway-dev.{{ .Values.istio.ingress.basedomain }}"
