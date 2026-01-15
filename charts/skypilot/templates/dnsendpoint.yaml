@@ -8,4 +8,4 @@ spec:
     recordTTL: 180
     recordType: CNAME
     targets:
-    - "istio-ingressgateway-preview.{{ .Values.istio.ingress.basedomain }}"
+    - "istio-ingressgateway.{{ .Values.istio.ingress.basedomain }}"

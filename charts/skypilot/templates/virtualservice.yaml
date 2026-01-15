@@ -7,7 +7,7 @@ spec:
   hosts:
   - {{ .Values.istio.ingress.prefix }}{{ .Values.istio.ingress.host }}.{{ .Values.istio.ingress.basedomain }}
   gateways:
-  - istio-system/istio-ingressgateway-preview
+  - istio-system/istio-ingressgateway
   - mesh
   http:
   - route:
