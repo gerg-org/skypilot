@@ -498,7 +498,7 @@ gcpCredentials:
 
 # Populate RunPod credentials from the secret with key `api_key`
 runpodCredentials:
-  enabled: false
+  enabled: true
   # Name of the secret containing the RunPod credentials. Only used if enabled is true.
   runpodSecretName: runpod-credentials
 
