@@ -4,7 +4,7 @@ set -eu
 LABEL_SELECTOR="app=test-api"
 DEST_PATH="/root/execute-smoke-test.sh"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-LOCAL_SCRIPT="${SCRIPT_DIR}/git-source/ci/execute-smoke-test.sh"
+LOCAL_SCRIPT="${SCRIPT_DIR}/execute-smoke-test.sh"
 
 if [ ! -f "${LOCAL_SCRIPT}" ]; then
 	echo "Smoke test script not found: ${LOCAL_SCRIPT}" >&2
