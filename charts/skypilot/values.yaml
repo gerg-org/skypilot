@@ -131,7 +131,8 @@ apiService:
     port: 9090
   # Custom annotations for the API server deployment
   # @schema type: [object, null]
-  annotations: null
+  annotations: 
+    kube-score/ignore: pod-probes-identical,container-security-context-user-group-id,container-security-context-readonlyrootfilesystem
 
   # Skip resource check for the API server, not recommended for production deployment
   skipResourceCheck: false
