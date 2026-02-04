@@ -5,7 +5,7 @@ metadata:
 spec:
   endpointSelector:
     matchLabels:
-      app: {{ .Release.Namespace }}-test-api
+      app: test-api
   egress:
     - toEntities:
         - all
