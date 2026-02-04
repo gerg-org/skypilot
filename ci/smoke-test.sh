@@ -1,5 +1,5 @@
 #!/bin/ash
-set -eu
+set -eux
 
 LABEL_SELECTOR="app=test-api"
 DEST_PATH="/root/execute-smoke-test.sh"
