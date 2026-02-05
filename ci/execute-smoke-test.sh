@@ -10,8 +10,8 @@ from pathlib import Path
 
 path = Path('tests/smoke_tests/smoke_tests_utils.py')
 text = path.read_text()
-old = "LOW_RESOURCE_ARG = '--cpus 2+ --memory 4+ --disk-size 20'"
-new = "LOW_RESOURCE_ARG = '--cpus 4+ --memory 8+ --disk-size 50'"
+old = "LOW_RESOURCE_ARG = '--cpus 2+ --memory 4+'"
+new = "LOW_RESOURCE_ARG = '--cpus 6+ --memory 8+'"
 if old not in text:
 	raise SystemExit('LOW_RESOURCE_ARG definition not found or already patched.')
 path.write_text(text.replace(old, new, 1))
