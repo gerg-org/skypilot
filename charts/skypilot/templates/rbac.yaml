@@ -9,6 +9,7 @@ metadata:
   annotations:
     {{- toYaml .Values.rbac.serviceAccountAnnotations | nindent 4 }}
   {{- end }}
+{{- if .Values.kubernetesCredentials.useApiServerCluster }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -37,6 +38,7 @@ roleRef:
   kind: ClusterRole
   name: {{ .Release.Name }}-api-role
   apiGroup: rbac.authorization.k8s.io
+{{- end }}
 {{- $namespace := .Values.kubernetesCredentials.inclusterNamespace | default .Release.Namespace }}
 {{- if ne $namespace .Release.Namespace }}
 ---
