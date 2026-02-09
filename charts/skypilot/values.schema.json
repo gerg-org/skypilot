@@ -172,6 +172,26 @@
                 "null"
             ],
             "properties": {
+                "externalProxy": {
+                    "type": [
+                        "object",
+                        "null"
+                    ],
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean"
+                        },
+                        "headerFormat": {
+                            "type": "string"
+                        },
+                        "headerName": {
+                            "type": "string"
+                        },
+                        "jwtIdentityClaim": {
+                            "type": "string"
+                        }
+                    }
+                },
                 "oauth": {
                     "type": [
                         "object",
@@ -305,6 +325,12 @@
             "items": {
                 "type": "object"
             }
+        },
+        "fullnameOverride": {
+            "type": [
+                "string",
+                "null"
+            ]
         },
         "gcpCredentials": {
             "type": "object",
@@ -465,6 +491,9 @@
                             "type": "boolean"
                         }
                     }
+                },
+                "unified": {
+                    "type": "boolean"
                 }
             }
         },

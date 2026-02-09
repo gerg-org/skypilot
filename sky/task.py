@@ -754,9 +754,19 @@ class Task:
             service = service_spec.SkyServiceSpec.from_yaml_config(service)
             task.set_service(service)
         elif pool is not None:
-            pool['pool'] = True
-            pool = service_spec.SkyServiceSpec.from_yaml_config(pool)
-            task.set_service(pool)
+            # When pool is a dict (from top-level pool: in YAML), wrap it
+            # properly The schema expects {'pool': {...}} structure, not
+            # {'workers': 1, 'pool': True}
+            if isinstance(pool, dict):
+                # pool is a dict like {'workers': 1, 'max_workers': 3}
+                # Wrap it as {'pool': {'workers': 1, 'max_workers': 3}}
+                pool_config_dict = {'pool': pool}
+            else:
+                # pool is a boolean True (shouldn't happen, but handle it)
+                pool_config_dict = {'pool': {}}
+            pool_spec = service_spec.SkyServiceSpec.from_yaml_config(
+                pool_config_dict)
+            task.set_service(pool_spec)
 
         volume_mounts = config.pop('volume_mounts', None)
         if volume_mounts is not None:
@@ -892,9 +902,9 @@ class Task:
                         raise exceptions.VolumeTopologyConflictError(
                             f'Volume {vol.volume_name} can only be attached on '
                             f'{key}:{req}, which conflicts with another volume '
-                            f'{vol_name} that requires {key}:{previous_req}.'
+                            f'{vol_name} that requires {key}:{previous_req}. '
                             f'Please use different volumes and retry.')
-                    topology[key] = (vol_name, req)
+                    topology[key] = (vol.volume_name, req)
         # Now we have the topology requirements from the intersection of all
         # volumes. Check if there is topology conflict with the resources.
         # Volume must have no conflict with ALL resources even if user
@@ -1118,6 +1128,22 @@ class Task:
     def get_estimated_outputs_size_gigabytes(self) -> Optional[float]:
         return self.estimated_outputs_size_gigabytes
 
+    @staticmethod
+    def _ensure_consistent_priority(
+        resources: Union[List['resources_lib.Resources'],
+                         Set['resources_lib.Resources']]
+    ) -> None:
+        priority = None
+        for r in resources:
+            if r.priority is None:
+                continue
+            if priority is None:
+                priority = r.priority
+            else:
+                if priority != r.priority:
+                    raise ValueError('Priority is not consistent '
+                                     f'across resources: {resources}')
+
     def set_resources(
         self, resources: Union['resources_lib.Resources',
                                List['resources_lib.Resources'],
@@ -1139,6 +1165,7 @@ class Task:
             resources = resources_lib.Resources.from_yaml_config(resources)
         elif isinstance(resources, resources_lib.Resources):
             resources = {resources}
+        self._ensure_consistent_priority(resources)
         # TODO(woosuk): Check if the resources are None.
         self.resources = _with_docker_login_config(resources, self.envs,
                                                    self.secrets)

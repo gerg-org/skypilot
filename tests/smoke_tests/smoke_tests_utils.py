@@ -14,6 +14,7 @@ import traceback
 from types import MethodType
 from typing import (Any, BinaryIO, Callable, Dict, Generator, List, NamedTuple,
                     Optional, Sequence, Set, Tuple, Union)
+from unittest.mock import patch
 import uuid
 
 import colorama
@@ -48,7 +49,8 @@ from sky.utils import yaml_utils
 # different job id.
 test_id = str(uuid.uuid4())[-2:]
 
-LAMBDA_TYPE = '--infra lambda --gpus A10'
+LAMBDA_GPU_TYPE = 'A100'
+LAMBDA_TYPE = f'--infra lambda --gpus {LAMBDA_GPU_TYPE}'
 FLUIDSTACK_TYPE = '--infra fluidstack --gpus RTXA4000'
 
 SCP_TYPE = '--infra scp'
@@ -304,6 +306,41 @@ def get_cmd_wait_until_managed_job_status_contains_matching_job_name(
         timeout=timeout)
 
 
+_WAIT_UNTIL_PIPELINE_TASK_STATUS = (
+    # A while loop to wait until a pipeline task (identified by line number)
+    # reaches a certain status, with timeout.
+    'start_time=$SECONDS; '
+    'while true; do '
+    'if (( $SECONDS - $start_time > {timeout} )); then '
+    '  echo "Timeout after {timeout} seconds waiting for task {task_line} to be {expected_status}"; exit 1; '
+    'fi; '
+    's=$(sky jobs queue); echo "$s"; '
+    'task_status=$(echo "$s" | grep -A 4 {job_name} | sed -n {task_line}p); '
+    'if echo "$task_status" | grep -E -q "{expected_status}"; then '
+    '  echo "Task {task_line} reached status {expected_status}."; break; '
+    'fi; '
+    'echo "Waiting for task {task_line} to be {expected_status}, current: $task_status"; '
+    'sleep 5; '
+    'done')
+
+
+def get_cmd_wait_until_pipeline_task_status(job_name: str, task_line: int,
+                                            expected_status: str, timeout: int):
+    """Get a command that waits until a pipeline task reaches a certain status.
+
+    Args:
+        job_name: The name of the job
+        task_line: The line number in the pipeline output (2 = first task, 3 = second, etc.)
+        expected_status: The expected status string (e.g., "CANCELLING|CANCELLED")
+        timeout: Timeout in seconds
+    """
+    return _WAIT_UNTIL_PIPELINE_TASK_STATUS.format(
+        job_name=job_name,
+        task_line=task_line,
+        expected_status=expected_status,
+        timeout=timeout)
+
+
 _WAIT_UNTIL_JOB_STATUS_SUCCEEDED = (
     'start_time=$SECONDS; '
     'while true; do '
@@ -435,6 +472,12 @@ def override_sky_config(
     if config_dict is not None:
         override_sky_config_dict.update(config_dict)
 
+    # Collect env overrides that need to be set in real os.environ for SDK
+    # calls. When env_dict is a copy (passed from run_one_test), SDK calls
+    # read from real os.environ, not env_dict. We use patch.dict to properly
+    # manage these overrides with automatic cleanup.
+    env_overrides: Dict[str, str] = {}
+
     if is_remote_server_test():
         endpoint = get_api_server_url()
         override_sky_config_dict.set_nested(('api_server', 'endpoint'),
@@ -444,11 +487,7 @@ def override_sky_config(
         # before we override the environment, so we need to disabled the
         # lru_cache of get_server_url and set SKY_API_SERVER_URL_ENV_VAR
         # to make sure the new endpoint is used.
-        env_dict[constants.SKY_API_SERVER_URL_ENV_VAR] = endpoint
-        # Clear the get_server_url cache
-        server_common.get_server_url.cache_clear()
-        # Clear the is_api_server_local cache
-        server_common.is_api_server_local.cache_clear()
+        env_overrides[constants.SKY_API_SERVER_URL_ENV_VAR] = endpoint
         echo(
             f'Overriding API server endpoint: '
             f'{override_sky_config_dict.get_nested(("api_server", "endpoint"), "UNKNOWN")}'
@@ -460,7 +499,7 @@ def override_sky_config(
                 ('api_server', 'service_account_token'), 'UNKNOWN')
             override_sky_config_dict.set_nested(
                 ('api_server', 'service_account_token'), service_account_token)
-            env_dict[
+            env_overrides[
                 constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR] = service_account_token
             echo(
                 f'Overriding service account token {service_account_token[:4]}...'
@@ -476,7 +515,7 @@ def override_sky_config(
             f'{override_sky_config_dict.get_nested(("jobs", "controller", "resources", "cloud"), "UNKNOWN")}'
         )
     if is_grpc_enabled_test():
-        env_dict[env_options.Options.ENABLE_GRPC.env_key] = '1'
+        env_overrides[env_options.Options.ENABLE_GRPC.env_key] = '1'
 
     if not override_sky_config_dict:
         yield None
@@ -488,19 +527,41 @@ def override_sky_config(
         original_config = skypilot_config.parse_and_validate_config_file(
             env_dict[skypilot_config.ENV_VAR_GLOBAL_CONFIG])
     else:
-        original_config = skypilot_config.config_utils.Config()
+        original_config = skypilot_config.get_user_config()
     overlay_config = skypilot_config.overlay_skypilot_config(
         original_config, override_sky_config_dict)
     temp_config_file.write(yaml_utils.dump_yaml_str(dict(overlay_config)))
     temp_config_file.flush()
-    # Update the environment variable to use the temporary file
-    env_dict[skypilot_config.ENV_VAR_GLOBAL_CONFIG] = temp_config_file.name
+
+    # Add config file to env overrides
+    env_overrides[skypilot_config.ENV_VAR_GLOBAL_CONFIG] = temp_config_file.name
+
+    # Update env_dict for subprocess calls
+    env_dict.update(env_overrides)
     if (env_before_override is not None and
             skypilot_config.ENV_VAR_GLOBAL_CONFIG in env_before_override):
         env_dict[skypilot_config.ENV_VAR_GLOBAL_CONFIG +
                  '_ORIGINAL'] = env_before_override[
                      skypilot_config.ENV_VAR_GLOBAL_CONFIG]
-    yield temp_config_file
+
+    def _clear_caches():
+        """Clear caches so they pick up new/restored env vars."""
+        server_common.get_server_url.cache_clear()
+        server_common.is_api_server_local.cache_clear()
+        skypilot_config.reload_config()
+
+    # Use patch.dict to properly manage os.environ for SDK calls.
+    # This ensures env vars are set in real os.environ (not just env_dict)
+    # and automatically restored when the context exits.
+    with patch.dict(os.environ, env_overrides):
+        _clear_caches()
+        try:
+            yield temp_config_file
+        finally:
+            pass  # patch.dict handles os.environ restoration
+    # After patch.dict exits, clear caches again to pick up restored env
+    _clear_caches()
+
     if env_before_override is not None:
         os.environ.clear()
         os.environ.update(env_before_override)
@@ -1179,7 +1240,7 @@ def get_available_gpus(default_gpu: str = 'T4',
         env_file = pytest_config_file_override()
         if env_file is not None:
             prefix = f'{skypilot_config.ENV_VAR_GLOBAL_CONFIG}={env_file}'
-        command = f'{prefix} sky show-gpus --infra {infra} | grep -A1 "^GPU" | grep " {count}" | tail -1 | awk "{{print \$1}}"'
+        command = f'{prefix} sky gpus list --infra {infra} | grep -A1 "^GPU" | grep " {count}" | tail -1 | awk "{{print \$1}}"'
         Test.echo_without_prefix(command)
         result = subprocess_utils.run(command,
                                       shell=True,
