@@ -447,12 +447,12 @@ rbac:
       verbs: ["list", "get"]
   # This allows the API server to grant permissions to SkyPilot Pods and system components.
   # `kubernetes.remote_identity` must be specified in the sky config if this is disabled.
-  manageRbacPolicies: true
+  manageRbacPolicies: false
   # This allows the API server to manage system components in the skypilot-system namespace.
   # Required for object store mounting.
   # You can disable this if you do not need additional capabilities of system components like
   # object store mounting or you manage system components manually, i.e. outside of SkyPilot.
-  manageSystemComponents: true
+  manageSystemComponents: false
 
   # Custom annotations for the API server service account.
   # @schema type: [object, null]
