@@ -131,7 +131,8 @@ apiService:
     port: 9090
   # Custom annotations for the API server deployment
   # @schema type: [object, null]
-  annotations: null
+  annotations: 
+    kube-score/ignore: pod-probes-identical,container-security-context-user-group-id,container-security-context-readonlyrootfilesystem
 
   # Skip resource check for the API server, not recommended for production deployment
   skipResourceCheck: false
@@ -446,12 +447,12 @@ rbac:
       verbs: ["list", "get"]
   # This allows the API server to grant permissions to SkyPilot Pods and system components.
   # `kubernetes.remote_identity` must be specified in the sky config if this is disabled.
-  manageRbacPolicies: true
+  manageRbacPolicies: false
   # This allows the API server to manage system components in the skypilot-system namespace.
   # Required for object store mounting.
   # You can disable this if you do not need additional capabilities of system components like
   # object store mounting or you manage system components manually, i.e. outside of SkyPilot.
-  manageSystemComponents: true
+  manageSystemComponents: false
 
   # Custom annotations for the API server service account.
   # @schema type: [object, null]
@@ -461,7 +462,7 @@ rbac:
 # kubernetesCredentials add additional kubernetes cluster permissions to the API server.
 kubernetesCredentials:
   # Enable/disable using the API server's cluster for workloads
-  useApiServerCluster: true
+  useApiServerCluster: false
   # Use the `kube-credentials` secret containing the kubeconfig to authenticate to Kubernetes
   useKubeconfig: false
   # Name of the secret containing the kubeconfig file. Only used if useKubeconfig is true.
