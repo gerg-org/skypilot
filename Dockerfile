@@ -74,6 +74,7 @@ ARG NEXT_BASE_PATH=/dashboard
 # Install system packages
 # hadolint ignore=DL3008,DL3015
 RUN apt-get update -y && \
+    apt-get upgrade -y && \
     apt-get install --no-install-recommends -y \
         git gcc rsync sudo patch openssh-server \
         pciutils nano fuse socat netcat-openbsd curl tini autossh jq logrotate && \

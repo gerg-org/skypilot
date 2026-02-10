@@ -143,6 +143,7 @@ SCP = clouds.SCP
 Slurm = clouds.Slurm
 Kubernetes = clouds.Kubernetes
 K8s = Kubernetes
+SSH = clouds.SSH
 OCI = clouds.OCI
 Paperspace = clouds.Paperspace
 PrimeIntellect = clouds.PrimeIntellect
@@ -154,6 +155,7 @@ Nebius = clouds.Nebius
 Hyperbolic = clouds.Hyperbolic
 Shadeform = clouds.Shadeform
 Seeweb = clouds.Seeweb
+Yotta = clouds.Yotta
 
 __all__ = [
     '__version__',
@@ -164,6 +166,7 @@ __all__ = [
     'IBM',
     'Kubernetes',
     'K8s',
+    'SSH',
     'Lambda',
     'OCI',
     'Paperspace',
@@ -178,6 +181,7 @@ __all__ = [
     'Hyperbolic',
     'Shadeform',
     'Seeweb',
+    'Yotta',
     'Optimizer',
     'OptimizeTarget',
     'backends',

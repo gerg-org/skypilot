@@ -37,6 +37,7 @@ from sky.utils import common_utils
 from sky.utils import config_utils
 from sky.utils import env_options
 from sky.utils import kubernetes_enums
+from sky.utils import plugin_extensions
 from sky.utils import schemas
 from sky.utils import status_lib
 from sky.utils import timeline
@@ -44,7 +45,9 @@ from sky.utils import ux_utils
 from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
+    from dateutil import parser as dateutil_parser
     import jinja2
+    from kubernetes.client import models as kubernetes_models
     import yaml
 
     from sky import backends
@@ -52,6 +55,8 @@ if typing.TYPE_CHECKING:
 else:
     jinja2 = adaptors_common.LazyImport('jinja2')
     yaml = adaptors_common.LazyImport('yaml')
+    dateutil_parser = adaptors_common.LazyImport('dateutil.parser')
+    kubernetes_models = adaptors_common.LazyImport('kubernetes.client.models')
 
 # Please be careful when changing this.
 # When mounting, Kubernetes changes the ownership of the parent directory
@@ -95,12 +100,21 @@ class KubernetesHighPerformanceNetworkType(enum.Enum):
     GCP_GPUDIRECT_RDMA = 'gcp_gpudirect_rdma'
     NEBIUS = 'nebius'
     COREWEAVE = 'coreweave'
+    TOGETHER = 'together'
+    AWS_EFA = 'aws_efa'
     NONE = 'none'
 
     def get_network_env_vars(self) -> Dict[str, str]:
         """Get network environment variables for this cluster type."""
         if self == KubernetesHighPerformanceNetworkType.NEBIUS:
             # Nebius cluster with InfiniBand - use InfiniBand optimizations
+            return {
+                'NCCL_IB_HCA': 'mlx5',
+                'UCX_NET_DEVICES': ('mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,'
+                                    'mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1')
+            }
+        elif self == KubernetesHighPerformanceNetworkType.TOGETHER:
+            # Together AI cluster with InfiniBand - use InfiniBand optimizations
             return {
                 'NCCL_IB_HCA': 'mlx5',
                 'UCX_NET_DEVICES': ('mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,'
@@ -113,6 +127,10 @@ class KubernetesHighPerformanceNetworkType(enum.Enum):
                 # Restrict UCX to TCP to avoid unneccsary errors. NCCL doesn't use UCX
                 'UCX_TLS': 'tcp',
                 'UCX_NET_DEVICES': 'eth0',
+            }
+        elif self == KubernetesHighPerformanceNetworkType.AWS_EFA:
+            return {
+                'FI_PROVIDER': 'efa',
             }
         else:
             # GCP clusters and generic clusters - environment variables are
@@ -144,6 +162,7 @@ DEFAULT_NAMESPACE = 'default'
 DEFAULT_SERVICE_ACCOUNT_NAME = 'skypilot-service-account'
 
 MEMORY_SIZE_UNITS = {
+    'm': 0.001,
     'B': 1,
     'K': 2**10,
     'M': 2**20,
@@ -676,14 +695,14 @@ class GFDLabelFormatter(GPULabelFormatter):
         """Searches against a canonical list of NVIDIA GPUs and pattern
         matches the canonical GPU name against the GFD label.
         """
-        canonical_gpu_names = [
-            'A100-80GB', 'A100', 'A10G', 'H100', 'K80', 'M60', 'T4g', 'T4',
-            'V100', 'A10', 'P4000', 'P100', 'P40', 'P4', 'L40', 'L4'
-        ]
-        for canonical_name in canonical_gpu_names:
-            # A100-80G accelerator is A100-SXM-80GB or A100-PCIE-80GB
+        for canonical_name in kubernetes_constants.CANONICAL_GPU_NAMES:
+            # A100-80GB accelerator is A100-SXM-80GB or A100-PCIE-80GB
             if canonical_name == 'A100-80GB' and re.search(
                     r'A100.*-80GB', value):
+                return canonical_name
+            # H100-80GB accelerator is H100-SXM-80GB or H100-PCIE-80GB
+            if canonical_name == 'H100-80GB' and re.search(
+                    r'H100.*-80GB', value):
                 return canonical_name
             # Use word boundary matching to prevent substring matches
             elif re.search(rf'\b{re.escape(canonical_name)}\b', value):
@@ -694,10 +713,47 @@ class GFDLabelFormatter(GPULabelFormatter):
         # 2. remove 'GEFORCE-' (e.g., 'NVIDIA-GEFORCE-RTX-3070' -> 'RTX-3070')
         # 3. remove 'RTX-' (e.g. 'RTX-6000' -> 'RTX6000')
         # Same logic, but uppercased, as the Skypilot labeler job found in
-        # sky/utils/kubernetes/k8s_gpu_labeler_setup.yaml
+        # sky/utils/kubernetes/k8s_gpu_labeler_setup.yaml.j2
         return value.upper().replace('NVIDIA-',
                                      '').replace('GEFORCE-',
                                                  '').replace('RTX-', 'RTX')
+
+
+def _accelerator_name_matches(requested_acc: str,
+                              viable_names: List[str]) -> bool:
+    """Check if requested accelerator matches any viable name.
+
+    For backward compatibility with GPU name changes (e.g., when canonical names
+    like 'H200' are added to replace fallback names like 'H200-SXM-80GB'), this
+    function also matches if one name is a prefix of the other separated by '-'.
+
+    This handles cases where:
+    - Clusters were launched with fallback names (e.g., 'H200-SXM-80GB') but
+      after upgrading, the same label now maps to canonical name (e.g., 'H200').
+    - Users specify canonical names but the cluster uses fallback names.
+
+    Args:
+        requested_acc: The accelerator type requested (e.g., from launched_resources).
+        viable_names: List of viable accelerator names from node labels.
+
+    Returns:
+        True if the requested accelerator matches any viable name.
+    """
+    requested_lower = requested_acc.lower()
+    for viable in viable_names:
+        viable_lower = viable.lower()
+        if requested_lower == viable_lower:
+            return True
+        # Check prefix match with '-' separator for backward compatibility.
+        # E.g., 'H200' matches 'H200-SXM-80GB' and vice versa.
+        shorter, longer = ((requested_lower, viable_lower)
+                           if len(requested_lower) <= len(viable_lower) else
+                           (viable_lower, requested_lower))
+        if longer.startswith(shorter):
+            # Ensure it's a proper prefix (followed by '-' or end of string)
+            if len(longer) == len(shorter) or longer[len(shorter)] == '-':
+                return True
+    return False
 
 
 class KarpenterLabelFormatter(SkyPilotLabelFormatter):
@@ -995,8 +1051,8 @@ class GKEAutoscaler(Autoscaler):
         logger.debug(
             f'checking if autoscale-enabled node pool {node_pool_name} '
             f'can create a node satisfying {instance_type}')
-        k8s_instance_type = KubernetesInstanceType.\
-            from_instance_type(instance_type)
+        k8s_instance_type = (
+            KubernetesInstanceType.from_instance_type(instance_type))
         node_config = node_pool['config']
         machine_type = node_config['machineType']
 
@@ -1044,7 +1100,16 @@ class GKEAutoscaler(Autoscaler):
                          f'{node_pool_name}.')
             return True
 
-        vcpus, mem = clouds.GCP.get_vcpus_mem_from_instance_type(machine_type)
+        try:
+            vcpus, mem = clouds.GCP.get_vcpus_mem_from_instance_type(
+                machine_type)
+        except ValueError as e:
+            logger.warning(
+                f'Failed to get vcpu and memory from instance type '
+                f'{machine_type}. Skipping the fit check for node pool '
+                f'{node_pool_name}, assuming the node pool can create a node '
+                f'satisfying {k8s_instance_type}. Error: {e}')
+            return True
         if vcpus is not None and vcpus < k8s_instance_type.cpus:
             logger.debug(f'vcpu check failed for {machine_type} '
                          f'on node pool {node_pool_name}')
@@ -1074,7 +1139,9 @@ class GKEAutoscaler(Autoscaler):
                 continue
             node_accelerator_count = accelerator['acceleratorCount']
             viable_names = [node_accelerator_type.lower(), raw_value.lower()]
-            if (requested_gpu_type.lower() in viable_names and
+            # Use _accelerator_name_matches for backward compatibility
+            # with GPU name changes (e.g., 'H200' vs 'H200-SXM-80GB').
+            if (_accelerator_name_matches(requested_gpu_type, viable_names) and
                     int(node_accelerator_count) >= requested_gpu_count):
                 return True
         return False
@@ -1221,14 +1288,31 @@ class V1NodeStatus:
 
 
 @dataclasses.dataclass
+class V1Taint:
+    """Represents a Kubernetes node taint."""
+    key: str
+    effect: str
+    value: Optional[str] = None
+
+
+@dataclasses.dataclass
+class V1NodeSpec:
+    """Represents a Kubernetes node spec."""
+    unschedulable: bool
+    taints: List[V1Taint]
+
+
+@dataclasses.dataclass
 class V1Node:
     """Represents a Kubernetes node."""
     metadata: V1ObjectMeta
     status: V1NodeStatus
+    spec: V1NodeSpec
 
     @classmethod
     def from_dict(cls, data: dict) -> 'V1Node':
         """Create V1Node from a dictionary."""
+        spec_data = data.get('spec', {})
         return cls(metadata=V1ObjectMeta(
             name=data['metadata']['name'],
             labels=data['metadata'].get('labels', {}),
@@ -1245,7 +1329,15 @@ class V1Node:
                            V1NodeCondition(type=cond['type'],
                                            status=cond['status'])
                            for cond in data['status'].get('conditions', [])
-                       ]))
+                       ]),
+                   spec=V1NodeSpec(unschedulable=spec_data.get(
+                       'unschedulable', False),
+                                   taints=[
+                                       V1Taint(key=taint['key'],
+                                               effect=taint['effect'],
+                                               value=taint.get('value'))
+                                       for taint in spec_data.get('taints', [])
+                                   ]))
 
     def is_ready(self) -> bool:
         """Check if the node is ready based on its conditions.
@@ -1257,6 +1349,50 @@ class V1Node:
             if condition.type == 'Ready':
                 return condition.status == 'True'
         return False
+
+    def is_cordoned(self) -> bool:
+        """Check if the node is cordoned based on its spec.unschedulable."""
+        return self.spec.unschedulable
+
+    def get_taints(
+        self,
+        exclude_cordon: bool = False,
+        exclude_not_ready: bool = False,
+        exclude_effects: Optional[List[str]] = None,
+        exclude_keys: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get the taints on the node.
+
+        Args:
+            exclude_cordon: Whether to exclude the cordon taint.
+            exclude_not_ready: Whether to exclude the not ready taint.
+            exclude_effects: The taint effects to exclude,
+              e.g. ['PreferNoSchedule'].
+            exclude_keys: The taint keys to exclude.
+
+        Returns:
+            List[Dict[str, Any]]: The taints on the node.
+        """
+        taints = []
+        for t in self.spec.taints:
+            if (exclude_cordon and
+                    t.key == 'node.kubernetes.io/unschedulable' and
+                    t.effect == 'NoSchedule'):
+                continue
+            if (exclude_not_ready and
+                    t.key == 'node.kubernetes.io/unreachable' and
+                (t.effect == 'NoSchedule' or t.effect == 'NoExecute')):
+                continue
+            if exclude_effects and t.effect in exclude_effects:
+                continue
+            if exclude_keys and t.key in exclude_keys:
+                continue
+            taints.append({
+                'key': t.key,
+                'value': t.value if t.value else None,
+                'effect': t.effect
+            })
+        return taints
 
 
 @annotations.lru_cache(scope='request', maxsize=10)
@@ -1331,12 +1467,20 @@ class V1Pod:
 
 
 @_retry_on_error(resource_type='pod')
-def get_allocated_gpu_qty_by_node(
+def get_allocated_resources_by_node(
     *,
     context: Optional[str] = None,
-) -> Dict[str, int]:
-    """Gets allocated GPU quantity by each node by fetching pods in
+) -> Tuple[Dict[str, int], Dict[str, Tuple[float, float]]]:
+    """Gets allocated GPU, CPU, and memory by each node by fetching pods in
     all namespaces in kubernetes cluster indicated by context.
+
+    This function combines GPU and CPU/memory allocation tracking into a single
+    API call for better performance.
+
+    Returns:
+        Tuple of (allocated_gpu_qty_by_node, allocated_cpu_memory_by_node):
+        - allocated_gpu_qty_by_node: Dict mapping node name to allocated GPU count
+        - allocated_cpu_memory_by_node: Dict mapping node name to (allocated_cpu, allocated_memory_gb) tuple
     """
     if context is None:
         context = get_current_kube_config_context_name()
@@ -1355,27 +1499,65 @@ def get_allocated_gpu_qty_by_node(
         field_selector=field_selector)
     try:
         allocated_qty_by_node: Dict[str, int] = collections.defaultdict(int)
+        allocated_cpu_memory_by_node: Dict[str, Tuple[
+            float, float]] = collections.defaultdict(lambda: (0.0, 0.0))
         for item_dict in ijson.items(response,
                                      'items.item',
                                      buf_size=IJSON_BUFFER_SIZE):
             pod = V1Pod.from_dict(item_dict)
             if should_exclude_pod_from_gpu_allocation(pod):
                 logger.debug(
-                    f'Excluding pod {pod.metadata.name} from GPU count '
+                    f'Excluding pod {pod.metadata.name} from resource count '
                     f'calculations on node {pod.spec.node_name}')
                 continue
-            # Iterate over all the containers in the pod and sum the
-            # GPU requests
+            if not pod.spec.node_name:
+                continue
+
+            # Iterate over all the containers in the pod and sum the resources
             pod_allocated_qty = 0
+            pod_allocated_cpu = 0.0
+            pod_allocated_memory_gb = 0.0
             for container in pod.spec.containers:
                 if container.resources.requests:
+                    requests = container.resources.requests
+                    # Parse GPU
                     pod_allocated_qty += get_node_accelerator_count(
-                        context, container.resources.requests)
-            if pod_allocated_qty > 0 and pod.spec.node_name:
+                        context, requests)
+                    # Parse CPU
+                    if 'cpu' in requests:
+                        pod_allocated_cpu += parse_cpu_or_gpu_resource_to_float(
+                            requests['cpu'])
+                    # Parse memory
+                    if 'memory' in requests:
+                        pod_allocated_memory_gb += parse_memory_resource(
+                            requests['memory'], unit='G')
+
+            if pod_allocated_qty > 0:
                 allocated_qty_by_node[pod.spec.node_name] += pod_allocated_qty
-        return allocated_qty_by_node
+            if pod_allocated_cpu > 0 or pod_allocated_memory_gb > 0:
+                current_cpu, current_memory = allocated_cpu_memory_by_node[
+                    pod.spec.node_name]
+                allocated_cpu_memory_by_node[pod.spec.node_name] = (
+                    current_cpu + pod_allocated_cpu,
+                    current_memory + pod_allocated_memory_gb)
+        return allocated_qty_by_node, allocated_cpu_memory_by_node
     finally:
         response.release_conn()
+
+
+@_retry_on_error(resource_type='pod')
+def get_allocated_gpu_qty_by_node(
+    *,
+    context: Optional[str] = None,
+) -> Dict[str, int]:
+    """Gets allocated GPU quantity by each node by fetching pods in
+    all namespaces in kubernetes cluster indicated by context.
+
+    Note: For better performance when you also need CPU/memory allocation,
+    use get_allocated_resources_by_node() instead.
+    """
+    allocated_qty_by_node, _ = get_allocated_resources_by_node(context=context)
+    return allocated_qty_by_node
 
 
 def check_instance_fits(context: Optional[str],
@@ -1662,11 +1844,13 @@ def get_accelerator_label_key_values(
                     continue
                 for label, value in label_list:
                     if label_formatter.match_label_key(label):
-                        # match either canonicalized name or raw name
+                        # Match either canonicalized name or raw name.
+                        # Use _accelerator_name_matches for backward compatibility
+                        # with GPU name changes (e.g., H200-SXM-80GB -> H200).
                         accelerator = (label_formatter.
                                        get_accelerator_from_label_value(value))
                         viable = [value.lower(), accelerator.lower()]
-                        if acc_type.lower() not in viable:
+                        if not _accelerator_name_matches(acc_type, viable):
                             continue
                         if is_tpu_on_gke(acc_type):
                             assert isinstance(label_formatter,
@@ -1839,8 +2023,7 @@ def check_credentials(context: Optional[str],
         gpu_msg = (f'Cluster has {len(unlabeled_nodes)} nodes with '
                    f'accelerators that are not labeled. '
                    f'To label the nodes, run '
-                   f'`python -m sky.utils.kubernetes.gpu_labeler '
-                   f'--context {context}`')
+                   f'`sky gpus label --context {context}`')
     else:
         try:
             # This function raises a ResourcesUnavailableError in three cases:
@@ -1897,7 +2080,7 @@ class PodValidator:
 
     @classmethod
     def validate(cls, data):
-        return cls.__validate(data, kubernetes.models.V1Pod)
+        return cls.__validate(data, kubernetes_models.V1Pod)
 
     @classmethod
     def __validate(cls, data, klass):
@@ -1930,7 +2113,7 @@ class PodValidator:
             if klass in cls.NATIVE_TYPES_MAPPING:
                 klass = cls.NATIVE_TYPES_MAPPING[klass]
             else:
-                klass = getattr(kubernetes.models, klass)
+                klass = getattr(kubernetes_models, klass)
 
         if klass in cls.PRIMITIVE_TYPES:
             return cls.__validate_primitive(data, klass)
@@ -1975,7 +2158,7 @@ class PodValidator:
         :return: date.
         """
         try:
-            return kubernetes.dateutil_parser.parse(string).date()
+            return dateutil_parser.parse(string).date()
         except ValueError as exc:
             raise ValueError(
                 f'Failed to parse `{string}` as date object') from exc
@@ -1990,7 +2173,7 @@ class PodValidator:
         :return: datetime.
         """
         try:
-            return kubernetes.dateutil_parser.parse(string)
+            return dateutil_parser.parse(string)
         except ValueError as exc:
             raise ValueError(
                 f'Failed to parse `{string}` as datetime object') from exc
@@ -2189,6 +2372,13 @@ def get_current_kube_config_context_name() -> Optional[str]:
         _, current_context = kubernetes.list_kube_config_contexts()
         return current_context['name']
     except k8s.config.config_exception.ConfigException:
+        # If kubeconfig is not available, check if running in-cluster and
+        # return the in-cluster context name. This is needed when kubeconfig
+        # is not uploaded to the pod (e.g., remote_identity: SERVICE_ACCOUNT)
+        # but we still need to know the context name for operations like
+        # port mode detection.
+        if is_incluster_config_available():
+            return kubernetes.in_cluster_context_name()
         return None
 
 
@@ -2313,7 +2503,7 @@ def parse_memory_resource(resource_qty_str: str,
     try:
         bytes_value = int(resource_str)
     except ValueError:
-        memory_size = re.sub(r'([KMGTPB]+)', r' \1', resource_str)
+        memory_size = re.sub(r'([KMGTPBm]+)', r' \1', resource_str)
         number, unit_index = [item.strip() for item in memory_size.split()]
         unit_index = unit_index[0]
         bytes_value = float(number) * MEMORY_SIZE_UNITS[unit_index]
@@ -3023,6 +3213,15 @@ def get_unlabeled_accelerator_nodes(context: Optional[str] = None) -> List[Any]:
     return unlabeled_nodes
 
 
+def get_handled_taint_keys() -> List[str]:
+    """Get the taint keys that will be handled automatically by SkyPilot."""
+    keys = [TPU_RESOURCE_KEY, *SUPPORTED_GPU_RESOURCE_KEYS.values()]
+    custom_key = os.getenv('CUSTOM_GPU_RESOURCE_KEY', None)
+    if custom_key:
+        keys.append(custom_key)
+    return keys
+
+
 def get_kubernetes_node_info(
         context: Optional[str] = None) -> models.KubernetesNodesInfo:
     """Gets the resource information for all the nodes in the cluster.
@@ -3044,6 +3243,20 @@ def get_kubernetes_node_info(
         KubernetesNodesInfo: A model that contains the node info map and other
             information.
     """
+    # Try external node info source first (e.g., node-info-service cache).
+    # This allows plugins to provide cached node info for faster queries.
+    if plugin_extensions.NodeInfoSource.is_registered():
+        # Resolve context before calling the provider so it can be cached
+        resolved_context = (context if context is not None else
+                            get_current_kube_config_context_name())
+        if resolved_context is not None:
+            result = plugin_extensions.NodeInfoSource.get(resolved_context)
+            if result is not None:
+                logger.debug(f'Got node info from external provider for '
+                             f'{resolved_context}')
+                return result
+        # Fall through to direct Kubernetes API query if provider returns None
+
     nodes = get_kubernetes_nodes(context=context)
 
     lf, _ = detect_gpu_label_formatter(context)
@@ -3061,16 +3274,32 @@ def get_kubernetes_node_info(
             has_accelerator_nodes = True
             break
 
-    # Get the allocated GPU quantity by each node
+    # Get the allocated resources (GPU, CPU, memory) by each node in a single call
     allocated_qty_by_node: Dict[str, int] = collections.defaultdict(int)
-    error_on_get_allocated_gpu_qty_by_node = False
+    allocated_cpu_memory_by_node: Dict[str, Tuple[float, float]] = {}
+    error_on_get_allocated_resources = False
+    # Get resource allocation. For GPU allocation, only call if there are GPU nodes
+    # (same as master branch). For CPU/memory, we always need it for all nodes.
     if has_accelerator_nodes:
+        # When there are GPU nodes, get both GPU and CPU/memory in one call
         try:
-            allocated_qty_by_node = get_allocated_gpu_qty_by_node(
+            allocated_qty_by_node, allocated_cpu_memory_by_node = get_allocated_resources_by_node(
                 context=context)
         except kubernetes.api_exception() as e:
             if e.status == 403:
-                error_on_get_allocated_gpu_qty_by_node = True
+                error_on_get_allocated_resources = True
+                pass
+            else:
+                raise
+    else:
+        # When there are no GPU nodes, we still need CPU/memory allocation
+        # This is an extra API call compared to master branch
+        try:
+            _, allocated_cpu_memory_by_node = get_allocated_resources_by_node(
+                context=context)
+        except kubernetes.api_exception() as e:
+            if e.status == 403:
+                error_on_get_allocated_resources = True
                 pass
             else:
                 raise
@@ -3106,8 +3335,42 @@ def get_kubernetes_node_info(
 
         accelerator_count = get_node_accelerator_count(context,
                                                        node.status.allocatable)
+
+        # Parse CPU and memory from node capacity
+        cpu_count = None
+        memory_gb = None
+        try:
+            if 'cpu' in node.status.capacity:
+                cpu_count = float(
+                    parse_cpu_or_gpu_resource(node.status.capacity['cpu']))
+            if 'memory' in node.status.capacity:
+                memory_gb = parse_memory_resource(
+                    node.status.capacity['memory'], unit='G')
+        except (KeyError, ValueError) as e:
+            # If parsing fails, log but continue
+            logger.debug(f'Failed to parse CPU/memory for node '
+                         f'{node.metadata.name}: {e}')
+
+        # Calculate free CPU and memory
+        cpu_free = None
+        memory_free_gb = None
+        if cpu_count is not None or memory_gb is not None:
+            if not error_on_get_allocated_resources:
+                allocated_cpu, allocated_memory = allocated_cpu_memory_by_node.get(
+                    node.metadata.name, (0.0, 0.0))
+                if cpu_count is not None:
+                    cpu_free = max(0.0, cpu_count - allocated_cpu)
+                if memory_gb is not None:
+                    memory_free_gb = max(0.0, memory_gb - allocated_memory)
+            # If we can't get allocation info, set free to None (unknown)
+
         # Check if node is ready
         node_is_ready = node.is_ready()
+        node_taints = node.get_taints(exclude_cordon=True,
+                                      exclude_not_ready=True,
+                                      exclude_effects=['PreferNoSchedule'],
+                                      exclude_keys=get_handled_taint_keys())
+        node_is_tainted = len(node_taints) > 0
 
         if accelerator_count == 0:
             node_info_dict[node.metadata.name] = models.KubernetesNodeInfo(
@@ -3116,13 +3379,20 @@ def get_kubernetes_node_info(
                 total={'accelerator_count': 0},
                 free={'accelerators_available': 0},
                 ip_address=node_ip,
-                is_ready=node_is_ready)
+                cpu_count=cpu_count,
+                memory_gb=memory_gb,
+                cpu_free=cpu_free,
+                memory_free_gb=memory_free_gb,
+                is_ready=node_is_ready,
+                is_cordoned=node.is_cordoned(),
+                taints=node_taints,
+            )
             continue
 
-        if not node_is_ready:
-            # If node is not ready, report 0 available GPUs
+        if not node_is_ready or node.is_cordoned() or node_is_tainted:
+            # If node is not ready, cordoned, or tainted, report 0 available GPUs
             accelerators_available = 0
-        elif not has_accelerator_nodes or error_on_get_allocated_gpu_qty_by_node:
+        elif not has_accelerator_nodes or error_on_get_allocated_resources:
             accelerators_available = -1
         else:
             allocated_qty = allocated_qty_by_node[node.metadata.name]
@@ -3141,7 +3411,14 @@ def get_kubernetes_node_info(
             total={'accelerator_count': int(accelerator_count)},
             free={'accelerators_available': int(accelerators_available)},
             ip_address=node_ip,
-            is_ready=node_is_ready)
+            cpu_count=cpu_count,
+            memory_gb=memory_gb,
+            cpu_free=cpu_free,
+            memory_free_gb=memory_free_gb,
+            is_ready=node_is_ready,
+            is_cordoned=node.is_cordoned(),
+            taints=node_taints,
+        )
     hint = ''
     if has_multi_host_tpu:
         hint = ('(Note: Multi-host TPUs are detected and excluded from the '
@@ -3467,6 +3744,28 @@ class KubernetesSkyPilotClusterInfoPayload:
         )
 
 
+def get_pod_primary_container(
+    pod: Any,
+    *,
+    primary_name: str = kubernetes_constants.RAY_NODE_CONTAINER_NAME,
+):
+    """Return the primary workload container for a SkyPilot pod.
+
+    Pods may include sidecars (e.g., log shippers). Kubernetes preserves the
+    ordering of the `containers` list as authored, but mutating webhooks can
+    inject additional containers. Callers should not rely on containers[0].
+    """
+    spec = getattr(pod, 'spec', None)
+    containers = getattr(spec, 'containers', None) if spec is not None else None
+    if not containers:
+        pod_name = getattr(getattr(pod, 'metadata', None), 'name', '<unknown>')
+        raise ValueError(f'Pod {pod_name!r} has no containers.')
+    for container in containers:
+        if getattr(container, 'name', None) == primary_name:
+            return container
+    return containers[0]
+
+
 def process_skypilot_pods(
     pods: List[Any],
     context: Optional[str] = None
@@ -3504,14 +3803,18 @@ def process_skypilot_pods(
                 start_time = pod.status.start_time.timestamp()
 
             # Parse resources
+            primary_container = get_pod_primary_container(pod)
+            resources = getattr(primary_container, 'resources', None)
+            requests = getattr(resources, 'requests',
+                               None) if resources else None
             cpu_request = parse_cpu_or_gpu_resource(
-                pod.spec.containers[0].resources.requests.get('cpu', '0'))
+                (requests.get('cpu', '0') if requests is not None else '0'))
             memory_request = parse_memory_resource(
-                pod.spec.containers[0].resources.requests.get('memory', '0'),
+                (requests.get('memory', '0') if requests is not None else '0'),
                 unit='G')
             gpu_count = parse_cpu_or_gpu_resource(
-                pod.spec.containers[0].resources.requests.get(
-                    get_gpu_resource_key(context), '0'))
+                (requests.get(get_gpu_resource_key(context), '0')
+                 if requests is not None else '0'))
             gpu_name = None
             if gpu_count > 0:
                 label_formatter, _ = (detect_gpu_label_formatter(context))
@@ -3790,3 +4093,25 @@ def get_cleaned_context_and_cloud_str(
         cloud_str = 'ssh'
         context = context[len('ssh-'):]
     return context, cloud_str
+
+
+def get_pvc_events(context: Optional[str],
+                   namespace: str,
+                   pvc_name: str,
+                   reverse: bool = True) -> List[Any]:
+    """Get the events for a PVC, sorted by creation_timestamp."""
+    try:
+        pvc_events = kubernetes.core_api(context).list_namespaced_event(
+            namespace,
+            field_selector=(f'involvedObject.name={pvc_name},'
+                            'involvedObject.kind=PersistentVolumeClaim'),
+            _request_timeout=kubernetes.API_TIMEOUT)
+    except (kubernetes.max_retry_error(), kubernetes.api_exception(),
+            kubernetes.config_exception()) as e:
+        logger.warning(f'Failed to get PVC events: {e}')
+        return []
+
+    return sorted(pvc_events.items,
+                  key=lambda e:
+                  (e.last_timestamp or e.metadata.creation_timestamp),
+                  reverse=reverse)

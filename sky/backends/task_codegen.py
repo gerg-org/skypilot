@@ -5,6 +5,7 @@ import inspect
 import json
 import math
 import os
+import shlex
 import textwrap
 from typing import Dict, List, Optional, Tuple
 
@@ -130,7 +131,8 @@ class TaskCodeGen:
             CANCELLED_RETURN_CODE = 137
             """))
 
-    def _get_rclone_flush_script(self) -> str:
+    @staticmethod
+    def get_rclone_flush_script() -> str:
         """Generate rclone flush script for cached storage mounts.
 
         This script blocks job completion until all storage mounted with
@@ -147,6 +149,7 @@ class TaskCodeGen:
         if [ $(findmnt -t fuse.rclone --noheading | wc -l) -gt 0 ] && \
            [ -d {constants.RCLONE_MOUNT_CACHED_LOG_DIR} ] && \
            [ "$(ls -A {constants.RCLONE_MOUNT_CACHED_LOG_DIR})" ]; then
+            FLUSH_START_TIME=$(date +%s)
             flushed=0
             # extra second on top of --vfs-cache-poll-interval to
             # avoid race condition between rclone log line creation and this check.
@@ -159,13 +162,32 @@ class TaskCodeGen:
                     exitcode=0
                     tac $file | grep "vfs cache: cleaned:" -m 1 | grep "in use 0, to upload 0, uploading 0" -q || exitcode=$?
                     if [ $exitcode -ne 0 ]; then
-                        echo "skypilot: cached mount is still uploading to remote"
+                        ELAPSED=$(($(date +%s) - FLUSH_START_TIME))
+                        # Extract the last vfs cache status line to show what we're waiting for
+                        CACHE_STATUS=$(tac $file | grep "vfs cache: cleaned:" -m 1 | sed 's/.*vfs cache: cleaned: //' 2>/dev/null)
+                        # Extract currently uploading files from recent log lines (show up to 2 files)
+                        UPLOADING_FILES=$(tac $file | head -30 | grep -E "queuing for upload" | head -2 | sed 's/.*INFO  : //' | sed 's/: vfs cache:.*//' | tr '\\n' ',' | sed 's/,$//' | sed 's/,/, /g' 2>/dev/null)
+                        # Build status message with available info
+                        if [ -n "$CACHE_STATUS" ] && [ -n "$UPLOADING_FILES" ]; then
+                            echo "skypilot: cached mount is still uploading (elapsed: ${{ELAPSED}}s) [${{CACHE_STATUS}}] uploading: ${{UPLOADING_FILES}}"
+                        elif [ -n "$CACHE_STATUS" ]; then
+                            echo "skypilot: cached mount is still uploading (elapsed: ${{ELAPSED}}s) [${{CACHE_STATUS}}]"
+                        else
+                            # Fallback: show last non-empty line from log
+                            LAST_LINE=$(tac $file | grep -v "^$" | head -1 | sed 's/.*INFO  : //' | sed 's/.*ERROR : //' | sed 's/.*NOTICE: //' 2>/dev/null)
+                            if [ -n "$LAST_LINE" ]; then
+                                echo "skypilot: cached mount is still uploading (elapsed: ${{ELAPSED}}s) ${{LAST_LINE}}"
+                            else
+                                echo "skypilot: cached mount is still uploading (elapsed: ${{ELAPSED}}s)"
+                            fi
+                        fi
                         flushed=0
                         break
                     fi
                 done
             done
-            echo "skypilot: cached mount uploaded complete"
+            TOTAL_FLUSH_TIME=$(($(date +%s) - FLUSH_START_TIME))
+            echo "skypilot: cached mount upload complete (took ${{TOTAL_FLUSH_TIME}}s)"
         fi""")
 
     def add_prologue(self, job_id: int) -> None:
@@ -592,7 +614,7 @@ class RayCodeGen(TaskCodeGen):
         options_str = ', '.join(options)
         logger.debug('Added Task with options: '
                      f'{options_str}')
-        rclone_flush_script = self._get_rclone_flush_script()
+        rclone_flush_script = self.get_rclone_flush_script()
         unset_ray_env_vars = ' && '.join(
             [f'unset {var}' for var in UNSET_RAY_ENV_VARS])
         self._code += [
@@ -644,14 +666,20 @@ class RayCodeGen(TaskCodeGen):
 class SlurmCodeGen(TaskCodeGen):
     """Code generator for task execution on Slurm using native srun."""
 
-    def __init__(self, slurm_job_id: str):
-        """Initialize SlurmCodeGen
+    def __init__(
+        self,
+        slurm_job_id: str,
+        container_name: Optional[str],
+    ):
+        """Initialize SlurmCodeGen.
 
         Args:
             slurm_job_id: The Slurm job ID, i.e. SLURM_JOB_ID
+            container_name: pyxis container name, or None
         """
         super().__init__()
         self._slurm_job_id = slurm_job_id
+        self._container_name = container_name
 
     def add_prologue(self, job_id: int) -> None:
         assert not self._has_prologue, 'add_prologue() called twice?'
@@ -785,9 +813,17 @@ class SlurmCodeGen(TaskCodeGen):
                                          for k, v in env_vars.items())
         sky_env_vars_dict_str = '\n'.join(sky_env_vars_dict_str)
 
-        rclone_flush_script = self._get_rclone_flush_script()
+        rclone_flush_script = self.get_rclone_flush_script()
         streaming_msg = self._get_job_started_msg()
         has_setup_cmd = self._setup_cmd is not None
+
+        container_flags = ''
+        if self._container_name is not None:
+            # --container-remap-root must be passed on every srun to get
+            # correct $HOME
+            container_flags = (
+                ' --container-remap-root'
+                f' --container-name={shlex.quote(self._container_name)}:exec')
 
         self._code += [
             sky_env_vars_dict_str,
@@ -856,18 +892,46 @@ class SlurmCodeGen(TaskCodeGen):
                     # $HOME/.local/bin/env (non-executable, from uv installation)
                     # shadows /usr/bin/env.
                     job_suffix = '-setup' if is_setup else ''
+                    # Unset SLURM_* environment variables before running srun.
+                    # When this srun runs inside another srun (from
+                    # SlurmCommandRunner.run), inherited variables like
+                    # SLURM_CPU_BIND, SLURM_NNODES, and SLURM_NODELIST constrain
+                    # the inner srun to the parent step's allocation. This causes
+                    # "CPU binding outside of job step allocation" errors.
+                    # Unsetting all SLURM_* variables allows this srun to access the full job
+                    # allocation. See:
+                    # https://support.schedmd.com/show_bug.cgi?id=14298
+                    # https://github.com/huggingface/datatrove/issues/248
+                    cmd_parts = []
+                    # Only unset SKY_RUNTIME_DIR for container runs. For non-container
+                    # runs, we want to inherit the node-local SKY_RUNTIME_DIR set by
+                    # SlurmCommandRunner to avoid SQLite WAL issues on shared filesystems.
+                    if {True if container_flags else False}:
+                        cmd_parts.append('unset SKY_RUNTIME_DIR;')
+                    cmd_parts.extend([
+                        constants.SKY_SLURM_PYTHON_CMD,
+                        '-m sky.skylet.executor.slurm',
+                        runner_args,
+                    ])
+                    bash_cmd = shlex.quote(' '.join(cmd_parts))
                     srun_cmd = (
+                        "unset $(env | awk -F= '/^SLURM_/ {{print $1}}') && "
                         f'srun --export=ALL --quiet --unbuffered --kill-on-bad-exit --jobid={self._slurm_job_id} '
-                        f'--job-name=sky-{self.job_id}{{job_suffix}} --ntasks-per-node=1 {{extra_flags}} '
-                        f'{{constants.SKY_SLURM_PYTHON_CMD}} -m sky.skylet.executor.slurm {{runner_args}}'
+                        f'--job-name=sky-{self.job_id}{{job_suffix}} --ntasks-per-node=1{container_flags} {{extra_flags}} '
+                        f'/bin/bash -c {{bash_cmd}}'
                     )
-                    return srun_cmd, script_path
+
+                    def cleanup():
+                        if script_path is not None:
+                            os.remove(script_path)
+
+                    return srun_cmd, cleanup
 
                 def run_thread_func():
                     # This blocks until Slurm allocates resources (--exclusive)
                     # --mem=0 to match RayCodeGen's behavior where we don't explicitly request memory.
                     run_flags = f'--nodes={num_nodes} --cpus-per-task={task_cpu_demand} --mem=0 {{gpu_arg}} --exclusive'
-                    srun_cmd, task_script_path = build_task_runner_cmd(
+                    srun_cmd, cleanup = build_task_runner_cmd(
                         script, run_flags, {log_dir!r}, sky_env_vars_dict,
                         task_name={task_name!r},
                         alloc_signal=alloc_signal_file,
@@ -882,8 +946,7 @@ class SlurmCodeGen(TaskCodeGen):
                         print(line, end='', flush=True)
                     proc.wait()
 
-                    if task_script_path is not None:
-                        os.remove(task_script_path)
+                    cleanup()
                     return {{'return_code': proc.returncode, 'pid': proc.pid}}
 
                 run_thread_result = {{'result': None}}
@@ -924,7 +987,7 @@ class SlurmCodeGen(TaskCodeGen):
                     # --overlap as we have already secured allocation with the srun for the run section,
                     # and otherwise this srun would get blocked and deadlock.
                     setup_flags = f'--overlap --nodes={self._setup_num_nodes}'
-                    setup_srun, setup_script_path = build_task_runner_cmd(
+                    setup_srun, setup_cleanup = build_task_runner_cmd(
                         {self._setup_cmd!r}, setup_flags, {self._setup_log_dir!r}, {self._setup_envs!r},
                         is_setup=True
                     )
@@ -938,8 +1001,7 @@ class SlurmCodeGen(TaskCodeGen):
                         print(line, end='', flush=True)
                     setup_proc.wait()
 
-                    if setup_script_path is not None:
-                        os.remove(setup_script_path)
+                    setup_cleanup()
 
                     setup_returncode = setup_proc.returncode
                     if setup_returncode != 0:

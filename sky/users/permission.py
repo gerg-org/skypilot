@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import threading
 from typing import Generator, List, Optional
 
 import casbin
@@ -15,6 +16,7 @@ from sky import sky_logging
 from sky.skylet import constants
 from sky.users import rbac
 from sky.utils import annotations
+from sky.utils import common
 from sky.utils import common_utils
 from sky.utils.db import db_utils
 
@@ -36,16 +38,23 @@ class PermissionService:
 
     def __init__(self):
         self.enforcer: Optional[casbin.Enforcer] = None
+        self._lock = threading.Lock()
 
-    def _lazy_initialize(self):
+    def initialize(self):
+        self._lazy_initialize(full_initialize=True)
+
+    def _lazy_initialize(self, full_initialize: bool = False):
         if self.enforcer is not None:
             return
-        with _policy_lock():
+        with self._lock:
+            if self.enforcer is not None:
+                return
             global _enforcer_instance
             if _enforcer_instance is None:
                 engine = global_user_state.initialize_and_get_db()
-                db_utils.add_all_tables_to_db_sqlalchemy(
-                    sqlalchemy_adapter.Base.metadata, engine)
+                if full_initialize:
+                    db_utils.add_all_tables_to_db_sqlalchemy(
+                        sqlalchemy_adapter.Base.metadata, engine)
                 adapter = sqlalchemy_adapter.Adapter(
                     engine, db_class=sqlalchemy_adapter.CasbinRule)
                 model_path = os.path.join(os.path.dirname(__file__),
@@ -56,8 +65,10 @@ class PermissionService:
                 # is successfully initialized, if we change it and then fail
                 # we will set it to None and all subsequent calls will fail.
                 _enforcer_instance = self
-                self._maybe_initialize_policies()
-                self._maybe_initialize_basic_auth_user()
+                if full_initialize:
+                    with _policy_lock():
+                        self._maybe_initialize_policies()
+                        self._maybe_initialize_basic_auth_user()
             else:
                 assert _enforcer_instance is not None
                 self.enforcer = _enforcer_instance.enforcer
@@ -103,7 +114,10 @@ class PermissionService:
                 logger.debug(f'Basic auth user {username} already exists')
                 return
             global_user_state.add_or_update_user(
-                models.User(id=user_hash, name=username, password=password))
+                models.User(id=user_hash,
+                            name=username,
+                            password=password,
+                            user_type=models.UserType.BASIC.value))
             enforcer = self._ensure_enforcer()
             enforcer.add_grouping_policy(user_hash, rbac.RoleName.ADMIN.value)
             enforcer.save_policy()
@@ -112,14 +126,14 @@ class PermissionService:
     def _maybe_initialize_policies(self) -> None:
         """Initialize policies if they don't already exist."""
         logger.debug(f'Initializing policies in process: {os.getpid()}')
-        self._load_policy_no_lock()
 
         policy_updated = False
 
         # Check if policies are already initialized by looking for existing
         # permission policies in the enforcer
         enforcer = self._ensure_enforcer()
-        existing_policies = enforcer.get_policy()
+        # Convert existing policies to set of tuples for O(1) lookups
+        existing_policies = {tuple(p) for p in enforcer.get_policy()}
 
         # Get plugin RBAC rules dynamically
         plugin_rules = self._get_plugin_rbac_rules()
@@ -129,12 +143,12 @@ class PermissionService:
         role_permissions = rbac.get_role_permissions(plugin_rules=plugin_rules)
         expected_policies = []
         for role, permissions in role_permissions.items():
-            if permissions['permissions'] and 'blocklist' in permissions[
-                    'permissions']:
+            if permissions.get('permissions'
+                              ) and 'blocklist' in permissions['permissions']:
                 blocklist = permissions['permissions']['blocklist']
                 for item in blocklist:
                     expected_policies.append(
-                        [role, item['path'], item['method']])
+                        (role, item['path'], item['method']))
 
         # Add workspace policy
         workspace_policy_permissions = rbac.get_workspace_policy_permissions()
@@ -143,51 +157,58 @@ class PermissionService:
 
         for workspace_name, users in workspace_policy_permissions.items():
             for user in users:
-                expected_policies.append([user, workspace_name, '*'])
-                logger.debug(f'Expected workspace policy: user={user}, '
-                             f'workspace={workspace_name}')
+                expected_policies.append((user, workspace_name, '*'))
+        # Check if all expected policies already exist and find missing ones
+        missing_policies = [
+            p for p in expected_policies if p not in existing_policies
+        ]
+        # Find policies to remove
+        expected_policies_set = set(expected_policies)
+        redundant_policies = [
+            p for p in existing_policies if p not in expected_policies_set
+        ]
+        if missing_policies:
+            # Add missing policies
+            logger.debug(f'Found {len(missing_policies)} missing policies, '
+                         'initializing...')
+            for p in missing_policies:
+                logger.debug(f'Adding policy: {p}')
+                enforcer.add_policy(*p)
+                policy_updated = True
+            logger.debug('Missing policies added successfully')
 
-        # Check if all expected policies already exist
-        policies_exist = all(
-            any(policy == expected
-                for policy in existing_policies)
-            for expected in expected_policies)
+        if redundant_policies:
+            # Remove redundant policies
+            logger.debug(f'Found {len(redundant_policies)} redundant policies, '
+                         'cleaning up...')
+            for p in redundant_policies:
+                logger.debug(f'Removing policy: {p}')
+                enforcer.remove_policy(*p)
+                policy_updated = True
+            logger.debug('Redundant policies removed successfully')
 
-        if not policies_exist:
-            # Only clear and reinitialize if policies don't exist or are
-            # incomplete
-            logger.debug('Policies not found or incomplete, initializing...')
-            # Only clear p policies (permission policies),
-            # keep g policies (role policies)
-            enforcer.remove_filtered_policy(0)
-            for role, permissions in role_permissions.items():
-                if permissions['permissions'] and 'blocklist' in permissions[
-                        'permissions']:
-                    blocklist = permissions['permissions']['blocklist']
-                    for item in blocklist:
-                        path = item['path']
-                        method = item['method']
-                        logger.debug(f'Adding role policy: role={role}, '
-                                     f'path={path}, method={method}')
-                        enforcer.add_policy(role, path, method)
-                        policy_updated = True
-
-            for workspace_name, users in workspace_policy_permissions.items():
-                for user in users:
-                    logger.debug(f'Initializing workspace policy: user={user}, '
-                                 f'workspace={workspace_name}')
-                    enforcer.add_policy(user, workspace_name, '*')
-                    policy_updated = True
-            logger.debug('Policies initialized successfully')
-        else:
-            logger.debug('Policies already exist, skipping initialization')
+        if not missing_policies and not redundant_policies:
+            logger.debug('Policies already in sync, skipping initialization')
 
         # Always ensure users have default roles (this is idempotent)
+        # Get users who already have roles (g policies) to avoid redundant calls
+        users_with_roles = {tuple(g)[0] for g in enforcer.get_grouping_policy()}
         all_users = global_user_state.get_all_users()
         for existing_user in all_users:
-            user_added = self._add_user_if_not_exists_no_lock(existing_user.id)
-            policy_updated = policy_updated or user_added
-
+            if str(existing_user.id) not in users_with_roles:
+                logger.debug(f'Adding role for user: {existing_user.name}'
+                             f'({existing_user.id})')
+                user_added = self._add_user_if_not_exists_no_lock(
+                    existing_user.id)
+                policy_updated = policy_updated or user_added
+        for system_user_id in [
+                common.SERVER_ID, constants.SKYPILOT_SYSTEM_USER_ID
+        ]:
+            if system_user_id not in users_with_roles:
+                logger.debug(f'Adding role for system user: {system_user_id}')
+                user_added = self._add_user_if_not_exists_no_lock(
+                    system_user_id, rbac.RoleName.ADMIN.value)
+                policy_updated = policy_updated or user_added
         if policy_updated:
             enforcer.save_policy()
 
@@ -197,7 +218,9 @@ class PermissionService:
         with _policy_lock():
             self._add_user_if_not_exists_no_lock(user_id)
 
-    def _add_user_if_not_exists_no_lock(self, user_id: str) -> bool:
+    def _add_user_if_not_exists_no_lock(self,
+                                        user_id: str,
+                                        role: Optional[str] = None) -> bool:
         """Add user role relationship without lock.
 
         Returns:
@@ -206,7 +229,8 @@ class PermissionService:
         enforcer = self._ensure_enforcer()
         user_roles = enforcer.get_roles_for_user(user_id)
         if not user_roles:
-            enforcer.add_grouping_policy(user_id, rbac.get_default_role())
+            enforcer.add_grouping_policy(user_id, role or
+                                         rbac.get_default_role())
             return True
         return False
 

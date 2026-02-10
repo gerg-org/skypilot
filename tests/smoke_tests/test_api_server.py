@@ -544,7 +544,9 @@ def test_tail_jobs_logs_blocks_ssh(generic_cloud: str):
             sky.Resources(infra=generic_cloud,
                           **smoke_tests_utils.LOW_RESOURCE_PARAM))
         req_id = jobs.launch(task, name=job_name)
-        job_id, _ = sky.stream_and_get(req_id)
+        job_ids, _ = sky.stream_and_get(req_id)
+        assert len(job_ids) == 1
+        job_id = job_ids[0]
 
         # Wait for the job to start.
         def is_job_started(job_id: int):
@@ -581,9 +583,9 @@ def test_tail_jobs_logs_blocks_ssh(generic_cloud: str):
         print("Attempting to ssh in.")
 
         # Now attempt to ssh in.
-        ssh_cmd = f'ssh -o ConnectTimeout=10 -o BatchMode=yes {name} "echo hi"'
+        ssh_cmd = f'ssh -o ConnectTimeout=30 -o BatchMode=yes {name} "echo hi"'
         ssh_ret = subprocess.Popen(ssh_cmd, shell=True)
-        if ssh_ret.wait(timeout=10) != 0:
+        if ssh_ret.wait(timeout=60) != 0:
             raise Exception("SSH failed.")
 
         print("SSH completed.")

@@ -301,10 +301,12 @@ Read the research:
    :caption: Jobs
 
    ../examples/managed-jobs
+   Checkpointing and Recovery <../examples/checkpointing>
    Multi-Node Jobs <../running-jobs/distributed-jobs>
    Many Parallel Jobs <../running-jobs/many-jobs>
    Model Training Guide <../reference/training-guide>
    Using a Pool of Workers <../examples/pools>
+   Job Groups <../examples/job-groups>
 
 .. toctree::
    :hidden:
@@ -342,6 +344,8 @@ Read the research:
    :maxdepth: 1
    :caption: User Guides
 
+   Migrating from Slurm <../reference/slurm-migration>
+   External Links <../running-jobs/external-links>
    ../reference/async
    ../running-jobs/environment-variables
    Docker Containers <../examples/docker-containers>
@@ -360,6 +364,7 @@ Read the research:
    ../cloud-setup/cloud-permissions/index
    Admin Policies <../cloud-setup/policy>
    External Logging Storage <../cloud-setup/external-logging>
+   Airgapped Environments <../cloud-setup/airgap>
 
 .. toctree::
    :hidden:
