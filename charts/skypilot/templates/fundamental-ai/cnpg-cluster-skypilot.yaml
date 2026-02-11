@@ -1,7 +1,7 @@
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
-  name: skypilot
+  name: skypilot-db
 spec:
   instances: 3
 
@@ -27,7 +27,7 @@ spec:
 
   bootstrap:
     initdb:
-      database: skypilot
+      database: skypilot-db
       secret:
         name: cnpg-skypilot
 
