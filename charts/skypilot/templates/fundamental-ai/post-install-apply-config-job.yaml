@@ -22,7 +22,7 @@ spec:
             name: {{ $fullName }}-apply-config-payload
       containers:
         - name: apply-config
-          image: curlimages/curl:8.6.0
+          image: {{ include "common.image" (dict "root" . "image" .Values.apiService.image) }}
           imagePullPolicy: IfNotPresent
           volumeMounts:
             - name: apply-config-payload
