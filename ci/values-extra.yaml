@@ -25,7 +25,7 @@ apiService:
 
   initialBasicAuthCredentials: "skypilot:$apr1$c1h4rNxt$2NnL7dIDUV0tWsnuNMGSr/"
   authUserHeaderName: X-authentik-email
-  dbConnectionSecretName: postgresql://skypilot:skypilot@skypilot-rw:5432/skypilot
+  dbConnectionSecretName: postgresql://skypilot-db:skypilot-db@skypilot-db-rw:5432/skypilot-db
   # Set the DB connection string directly. This is a shortcut for setting the DB connection string in a secret.
   # @schema type: [string, null]
   # dbConnectionString: null
