@@ -1,0 +1,44 @@
+{{- $fullName := include "skypilot.fullname" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullName }}-apply-config-payload
+data:
+  payload.json: |-
+    {
+      "config": {
+        "admin_policy": "admin_policy_examples.AddLabelsPolicy",
+        "kubernetes": {
+          "allowed_contexts": [
+            "lambda2"
+          ]
+        },
+        "jobs": {
+          "controller": {
+            "consolidation_mode": true,
+            "resources": {
+              "cloud": "aws",
+              "cpus": "4+",
+              "memory": "16+",
+              "disk_size": 100
+            }
+          }
+        },
+        "allowed_clouds": [
+          "aws",
+          "kubernetes",
+          "runpod",
+          "cudo",
+          "gcp",
+          "do",
+          "oci",
+          "vast",
+          "lambda"
+        ]
+      },
+      "env_vars": {
+        "SKYPILOT_IS_FROM_DASHBOARD": "true",
+        "SKYPILOT_USER_ID": "dashboard",
+        "SKYPILOT_USER": "dashboard"
+      }
+    }
