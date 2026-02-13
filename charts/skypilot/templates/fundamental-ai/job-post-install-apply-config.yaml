@@ -25,7 +25,7 @@ spec:
             name: {{ $fullName }}-apply-config-payload
       containers:
         - name: apply-config
-          image: {{ include "common.image" (dict "root" . "image" .Values.apiService.image) }}
+          image: REGISTRYURL/gergorg/curl:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
