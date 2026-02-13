@@ -15,6 +15,9 @@ spec:
       labels:
         app: {{ $fullName }}-apply-config
     spec:
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       restartPolicy: OnFailure
       volumes:
         - name: apply-config-payload
@@ -24,6 +27,12 @@ spec:
         - name: apply-config
           image: {{ include "common.image" (dict "root" . "image" .Values.apiService.image) }}
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
           volumeMounts:
             - name: apply-config-payload
               mountPath: /config
