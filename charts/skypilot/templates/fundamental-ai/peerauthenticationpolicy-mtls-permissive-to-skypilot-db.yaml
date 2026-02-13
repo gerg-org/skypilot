@@ -1,0 +1,10 @@
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: permissive-mtls-towards-skypilot-db
+spec:
+  mtls:
+    mode: PERMISSIVE
+  selector:
+    matchLabels:
+      cnpg.io/cluster: skypilot-db
