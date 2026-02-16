@@ -12,6 +12,8 @@ spec:
   backoffLimit: 6
   template:
     metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
       labels:
         app: {{ $fullName }}-apply-config
         retort/skypilot-egress: "true"
