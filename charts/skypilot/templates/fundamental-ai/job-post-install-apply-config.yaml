@@ -68,3 +68,4 @@ spec:
               done
               echo "Failed to apply SkyPilot config after retries"
               exit 1
+
