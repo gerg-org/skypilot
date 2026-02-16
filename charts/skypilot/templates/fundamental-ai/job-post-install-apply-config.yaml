@@ -43,7 +43,7 @@ spec:
           args:
             - |
               set -euo pipefail
-              api_url="http://{{ $fullName }}-api-service/api/v1/workspaces/config"
+              api_url="http://{{ $fullName }}-api-service/internal/dashboard/workspaces/config"
               payload_file="/config/payload.json"
               echo "Posting SkyPilot config to: $api_url"
               echo "Payload file: $payload_file"
