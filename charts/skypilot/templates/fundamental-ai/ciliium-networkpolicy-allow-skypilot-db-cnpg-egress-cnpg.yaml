@@ -1,0 +1,12 @@
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: "allow-skypilot-db-cnpg-egress-skypilot-db-cnpg"
+spec:
+  endpointSelector:
+    matchLabels:
+      io.cilium.k8s.policy.serviceaccount: skypilot-db
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        io.cilium.k8s.policy.serviceaccount: skypilot-db

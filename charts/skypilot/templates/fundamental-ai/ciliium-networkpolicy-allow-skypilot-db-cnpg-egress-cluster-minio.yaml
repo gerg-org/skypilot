@@ -1,0 +1,19 @@
+{{ if eq "prod" .Release.Namespace }}
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: "allow-skpilot-db-cnpg-egress-cluster-minio"
+spec:
+  endpointSelector:
+    matchLabels:
+      io.cilium.k8s.policy.serviceaccount: skypilot-db
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        app: minio
+        k8s:io.kubernetes.pod.namespace: minio
+    toPorts:
+      - ports:
+        - port: '9000'
+          protocol: TCP
+{{ end }}

@@ -1,0 +1,76 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: skypilot-db
+spec:
+  instances: 3
+
+  # Example of rolling update strategy:
+  # - unsupervised: automated update of the primary once all
+  #                 replicas have been upgraded (default)
+  # - supervised: requires manual supervision to perform
+  #               the switchover of the primary
+  primaryUpdateStrategy: unsupervised
+
+  imageName: REGISTRYURL/gergorg/cloudnative-pg-postgresql:16.2
+
+  # Persistent storage configuration
+  storage:
+    storageClass: topolvm-provisioner
+    size: 20Gi
+
+  monitoring:
+    enablePodMonitor: true
+                
+  superuserSecret:
+      name: cnpg-skypilot-superuser
+
+  bootstrap:
+    initdb:
+      database: skypilot-db
+      secret:
+        name: cnpg-skypilot
+
+  # Uncomment this and comment out the above to restore from the minio bucket
+  # bootstrap:
+  #   recovery:
+  #     source: cnpg-minio       
+
+  # backup:
+  #     # Volume snapshot backups
+  #     volumeSnapshot:
+  #       className: topolvm-provisioner
+  #     # WAL archive
+  #     barmanObjectStore:
+  #       serverName: skypilot-db # not necessary but we keep it here to keep this section consistent with the externalClusters section below
+  #       destinationPath: s3://cnpg/
+  #       endpointURL: "http://minio.minio:9000"
+  #       s3Credentials:
+  #         accessKeyId:
+  #           name: cnpg-minio-credentials
+  #           key: ACCESS_KEY_ID
+  #         secretAccessKey:
+  #           name: cnpg-minio-credentials
+  #           key: ACCESS_SECRET_KEY
+  #       wal:
+  #         compression: snappy
+  #         maxParallel: 2      
+  #     retentionPolicy: "7d"
+
+  # # This comes into play if/when we want to do a backup - ensure serverName is correctly set
+  # externalClusters:
+  #   - name: cnpg-minio
+  #     barmanObjectStore:  
+  #       serverName: skypilot-db      
+  #       destinationPath: s3://cnpg/
+  #       endpointURL: "http://minio.minio:9000"
+  #       s3Credentials:
+  #         accessKeyId:
+  #           name: cnpg-minio-credentials
+  #           key: ACCESS_KEY_ID
+  #         secretAccessKey:
+  #           name: cnpg-minio-credentials
+  #           key: ACCESS_SECRET_KEY
+  #       wal:
+  #         compression: snappy
+  #         maxParallel: 2      
