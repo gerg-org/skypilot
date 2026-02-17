@@ -43,7 +43,7 @@ spec:
               mountPath: /usr/local/bin/apply-config.sh
               subPath: apply-config.sh
               readOnly: true
-          command: ["/usr/local/bin/scuttle"]
+          command: ["/bin/scuttle"]
           args: ["/usr/local/bin/apply-config.sh"]
           env:
             - name: ISTIO_QUIT_API
