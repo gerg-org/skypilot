@@ -306,13 +306,13 @@ storage:
   #   AWS EFS, Azure Files, or an NFS provisioner). Both pods can mount the same PVC during the rolling update.
   # - storage.enabled=false: Supported - but file mounts and logs will be lost on pod restart. Consider configuring
   #   'jobs.bucket' in the SkyPilot config to use cloud storage for file mounts.
-  enabled: false
+  enabled: true
   # Storage class name - leave empty to use cluster default
   # For RWX storage with RollingUpdate, use a storage class that supports ReadWriteMany access mode:
   # - GKE: Create a Filestore-backed storage class (https://cloud.google.com/filestore/docs/accessing-fileshares)
   # - EKS: Use EFS CSI driver (https://docs.aws.amazon.com/eks/latest/userguide/efs-csi.html)
   # - AKS: Use Azure Files (https://docs.microsoft.com/azure/aks/azure-files-dynamic-pv)
-  storageClassName: ""
+  storageClassName: "topolvm-provisioner"
   # Access modes - ReadWriteOnce or ReadWriteMany depending on what is supported by the storage class
   # When using RollingUpdate upgrade strategy, ReadWriteMany is required for persistent storage.
   accessMode: ReadWriteOnce
