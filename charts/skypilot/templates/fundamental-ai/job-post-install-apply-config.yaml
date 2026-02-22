@@ -1,0 +1,55 @@
+{{- $fullName := include "skypilot.fullname" . -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $fullName }}-apply-config
+  annotations:
+    "helm.sh/hook": post-install
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+  labels:
+    app: {{ $fullName }}-apply-config
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app: {{ $fullName }}-apply-config
+        retort/skypilot-egress: "true"
+    spec:
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      restartPolicy: OnFailure
+      volumes:
+        - name: apply-config-payload
+          configMap:
+            name: {{ $fullName }}-apply-config-payload
+            defaultMode: 0755
+      containers:
+        - name: apply-config
+          image: REGISTRYURL/gergorg/tooling:stable
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: apply-config-payload
+              mountPath: /config
+              readOnly: true
+            - name: apply-config-payload
+              mountPath: /usr/local/bin/apply-config.sh
+              subPath: apply-config.sh
+              readOnly: true
+          command: ["/bin/scuttle"]
+          args: ["/usr/local/bin/apply-config.sh"]
+          env:
+            - name: ISTIO_QUIT_API
+              value: http://127.0.0.1:15020
+            - name: ENVOY_ADMIN_API
+              value: http://127.0.0.1:15000
+            - name: QUIT_WITHOUT_ENVOY_TIMEOUT
+              value: "30"
+
