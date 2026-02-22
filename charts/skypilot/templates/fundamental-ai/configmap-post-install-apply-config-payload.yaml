@@ -38,10 +38,9 @@ data:
   payload.json: |-
     {
       "config": {
-        "admin_policy": "admin_policy_examples.AddLabelsPolicy",
         "kubernetes": {
           "allowed_contexts": [
-            "lambda2"
+            "lambda"
           ]
         },
         "jobs": {
