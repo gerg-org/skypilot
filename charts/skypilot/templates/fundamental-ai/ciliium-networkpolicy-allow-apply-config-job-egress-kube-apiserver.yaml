@@ -1,0 +1,12 @@
+{{- $fullName := include "skypilot.fullname" . -}}
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: "allow-apply-config-job-egress-kube-apiserver"
+spec:
+  endpointSelector:
+    matchLabels:
+      io.cilium.k8s.policy.serviceaccount: {{ include "skypilot.fullname" . }}-apply-config-sa
+  egress:
+    - toEntities:
+        - kube-apiserver

@@ -10,8 +10,15 @@ spec:
   - istio-system/istio-ingressgateway
   - mesh
   http:
+    # no timeout for logs
+  - match:
+    - uri:
+        prefix: /jobs/logs
+    route:
+    - destination:
+        host: skypilot-api-service
   - route:
     - destination:
-        host: {{ .Release.Name }}-api-service
+        host: skypilot-api-service
     timeout: 30s   
 {{ end -}}

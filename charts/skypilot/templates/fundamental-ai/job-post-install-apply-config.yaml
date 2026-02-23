@@ -19,6 +19,7 @@ spec:
       securityContext:
         seccompProfile:
           type: RuntimeDefault
+      serviceAccountName: {{ include "skypilot.fullname" . }}-apply-config-sa
       restartPolicy: OnFailure
       volumes:
         - name: apply-config-payload

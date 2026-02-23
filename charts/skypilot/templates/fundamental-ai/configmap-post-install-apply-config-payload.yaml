@@ -24,7 +24,7 @@ data:
         echo "Applied SkyPilot config"
         echo "Response ($http_code):"
         cat /tmp/skypilot-config-response.json || true
-        exit 0
+        break
       fi
       echo "Request failed with status $http_code"
       echo "Response body:"
@@ -33,8 +33,34 @@ data:
       sleep 5
     done
 
-    echo "Failed to apply SkyPilot config after retries"
-    exit 1
+    if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+      echo "Failed to apply SkyPilot config after retries"
+      exit 1
+    fi
+
+    echo "Looking for deployments in current namespace suffixed with -api-server"
+    deployment_targets=$(kubectl get deployments \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | \
+      awk '/-api-server$/')
+
+    if [ -z "$deployment_targets" ]; then
+      echo "No deployments with suffix -api-server found"
+      exit 0
+    fi
+
+    rollout_timeout="10m"
+    echo "$deployment_targets" | while read -r deployment_name; do
+      if [ -n "$deployment_name" ]; then
+        echo "Restarting deployment ${deployment_name}"
+        kubectl rollout restart deployment "$deployment_name"
+        echo "Waiting for deployment ${deployment_name} to become healthy"
+        kubectl rollout status deployment "$deployment_name" --timeout="$rollout_timeout"
+        echo "Deployment ${deployment_name} is healthy"
+      fi
+    done
+
+    echo "Completed deployment restart(s)"
+
   payload.json: |-
     {
       "config": {
