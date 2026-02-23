@@ -1,11 +1,11 @@
 apiVersion: "cilium.io/v2"
 kind: CiliumNetworkPolicy
 metadata:
-  name: "allow-skypilot-test-egress-any"
+  name: "allow-skypilot-egress-any"
 spec:
   endpointSelector:
     matchLabels:
-      app: test-api
+      app: skypilot-api
   egress:
     - toEntities:
         - all
