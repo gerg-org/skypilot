@@ -17,8 +17,6 @@ spec:
     route:
     - destination:
         host: {{ .Release.Name }}-api-service
-        port:
-          number: {{ .Values.service.externalPort }}
   - route:
     - destination:
         host: {{ .Release.Name }}-api-service
