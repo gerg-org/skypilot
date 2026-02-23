@@ -48,16 +48,19 @@ data:
       exit 0
     fi
 
+    rollout_timeout="10m"
     echo "$deployment_targets" | while read -r deployment_name; do
       if [ -n "$deployment_name" ]; then
         echo "Restarting deployment ${deployment_name}"
         kubectl rollout restart deployment "$deployment_name"
+        echo "Waiting for deployment ${deployment_name} to become healthy"
+        kubectl rollout status deployment "$deployment_name" --timeout="$rollout_timeout"
+        echo "Deployment ${deployment_name} is healthy"
       fi
     done
 
     echo "Completed deployment restart(s)"
 
-    sleep 10m
   payload.json: |-
     {
       "config": {
