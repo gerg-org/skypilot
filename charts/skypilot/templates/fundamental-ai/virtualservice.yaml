@@ -10,6 +10,15 @@ spec:
   - istio-system/istio-ingressgateway
   - mesh
   http:
+    # no timeout for logs
+  - match:
+    - uri:
+        prefix: /jobs/logs
+    route:
+    - destination:
+        host: {{ .Release.Name }}-api-service
+        port:
+          number: {{ .Values.service.externalPort }}
   - route:
     - destination:
         host: {{ .Release.Name }}-api-service
