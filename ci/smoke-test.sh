@@ -1,7 +1,7 @@
 #!/bin/ash
 set -eux
 
-LABEL_SELECTOR="app=test-api"
+LABEL_SELECTOR="app=skypilot-api"
 DEST_PATH="/root/execute-smoke-test.sh"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 LOCAL_SCRIPT="${SCRIPT_DIR}/execute-smoke-test.sh"
