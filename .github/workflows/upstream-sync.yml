@@ -116,10 +116,10 @@ jobs:
 
           if [[ "$IS_MASTER" == "true" ]]; then
             DATA=$(gh pr list --base main --state open --json number,headRefName \
-              --jq '[.[] | select(.headRefName | startswith("upstream-sync/"))] | first // {}')
+              | jq '[.[] | select(.headRefName | startswith("upstream-sync/"))] | first // {}')
           else
             DATA=$(gh pr list --base main --state open --json number,headRefName \
-              --jq --arg b "$BRANCH_CANDIDATE" \
+              | jq --arg b "$BRANCH_CANDIDATE" \
               '[.[] | select(.headRefName == $b)] | first // {}')
           fi
 
