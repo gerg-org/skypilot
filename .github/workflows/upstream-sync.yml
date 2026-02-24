@@ -1,13 +1,16 @@
 name: Upstream Sync
 
-# Creates (or updates) a PR that merges skypilot-org/skypilot into main.
+# Creates (or updates) a PR that squash-merges skypilot-org/skypilot into main.
 # The PR acts as a gate: review, run CI, then merge on your own schedule.
 #
-# Scheduled run:  syncs upstream/master weekly.
-# Manual run:     lets you choose a specific branch, tag, or SHA instead.
+# Using squash merge (not a true merge commit) means the upstream commits are
+# never pushed as objects to origin, so GitHub's workflow-file push restriction
+# does not apply — no PAT required.
 #
-# The action reuses an existing open upstream-sync/* PR rather than creating
-# a new one each week, so rolling upstream commits accumulate in one place.
+# Each run resets the sync branch to origin/main and re-applies the full squash.
+# This means the PR always reflects the current upstream state, and any manual
+# conflict resolutions on the branch are overwritten. Merge the PR before the
+# next scheduled run if you have resolved conflicts.
 
 on:
   schedule:
@@ -25,26 +28,16 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  # NOTE: pushing commits that touch .github/workflows/ requires a PAT with the
-  # 'workflow' scope set as secrets.PAT. GITHUB_TOKEN cannot do this — GitHub
-  # blocks it at push time regardless of permissions declared here.
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Verify PAT is configured
-        run: |
-          if [[ -z "${{ secrets.PAT }}" ]]; then
-            echo "::error::secrets.PAT is not set. A PAT with 'repo' and 'workflow' scopes is required to push commits that modify .github/workflows/. GITHUB_TOKEN cannot do this."
-            exit 1
-          fi
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.PAT }}
+          token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         run: |
@@ -102,17 +95,17 @@ jobs:
             PR_TITLE="chore: sync upstream $UPSTREAM_REF"
           fi
 
-          echo "upstream_ref=$UPSTREAM_REF"         >> "$GITHUB_OUTPUT"
-          echo "is_master=$IS_MASTER"               >> "$GITHUB_OUTPUT"
-          echo "upstream_sha=$UPSTREAM_SHA"         >> "$GITHUB_OUTPUT"
+          echo "upstream_ref=$UPSTREAM_REF"             >> "$GITHUB_OUTPUT"
+          echo "is_master=$IS_MASTER"                   >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA"             >> "$GITHUB_OUTPUT"
           echo "upstream_sha_short=$UPSTREAM_SHA_SHORT" >> "$GITHUB_OUTPUT"
-          echo "branch_candidate=$BRANCH_CANDIDATE" >> "$GITHUB_OUTPUT"
-          echo "pr_title=$PR_TITLE"                 >> "$GITHUB_OUTPUT"
-          echo "today=$TODAY"                       >> "$GITHUB_OUTPUT"
+          echo "branch_candidate=$BRANCH_CANDIDATE"     >> "$GITHUB_OUTPUT"
+          echo "pr_title=$PR_TITLE"                     >> "$GITHUB_OUTPUT"
+          echo "today=$TODAY"                           >> "$GITHUB_OUTPUT"
 
       # Look for an existing open PR whose head branch starts with "upstream-sync/".
-      # For master syncs we reuse whatever branch is already open (accumulating
-      # upstream commits into a single PR). For tag syncs we match exactly.
+      # For master syncs we reuse whatever branch is already open.
+      # For tag syncs we match exactly.
       - name: Find existing sync PR
         id: existing
         env:
@@ -130,7 +123,7 @@ jobs:
               '[.[] | select(.headRefName == $b)] | first // {}')
           fi
 
-          PR_NUM=$(echo "$DATA"   | jq -r '.number      // empty')
+          PR_NUM=$(echo "$DATA"    | jq -r '.number      // empty')
           PR_BRANCH=$(echo "$DATA" | jq -r '.headRefName // empty')
 
           if [[ -n "$PR_NUM" ]]; then
@@ -139,34 +132,28 @@ jobs:
             echo "branch=$PR_BRANCH"     >> "$GITHUB_OUTPUT"
             echo "Reusing existing PR #$PR_NUM on branch $PR_BRANCH"
           else
-            echo "found=false"                           >> "$GITHUB_OUTPUT"
-            echo "pr_number="                            >> "$GITHUB_OUTPUT"
-            echo "branch=$BRANCH_CANDIDATE"              >> "$GITHUB_OUTPUT"
+            echo "found=false"                       >> "$GITHUB_OUTPUT"
+            echo "pr_number="                        >> "$GITHUB_OUTPUT"
+            echo "branch=$BRANCH_CANDIDATE"          >> "$GITHUB_OUTPUT"
             echo "No existing sync PR found; will create branch $BRANCH_CANDIDATE"
           fi
 
       - name: Check out sync branch
         run: |
-          FOUND="${{ steps.existing.outputs.found }}"
           BRANCH="${{ steps.existing.outputs.branch }}"
+          # Always reset to origin/main. With squash merge each run produces a
+          # single commit on top of main, so the branch is always recreated fresh.
+          # If an existing PR exists we force-push to its branch name to update it.
+          git checkout -b "$BRANCH" origin/main
 
-          if [[ "$FOUND" == "true" ]]; then
-            # Existing PR: start from the current state of the remote branch
-            git checkout -b "$BRANCH" "origin/$BRANCH"
-          else
-            # New PR: start from main so our custom changes are the base
-            git checkout -b "$BRANCH" origin/main
-          fi
-
-      - name: Merge upstream
+      - name: Squash-merge upstream
         id: merge
         run: |
           UPSTREAM_SHA="${{ steps.meta.outputs.upstream_sha }}"
           UPSTREAM_REF="${{ steps.meta.outputs.upstream_ref }}"
 
           set +e
-          git merge "$UPSTREAM_SHA" --no-edit \
-            -m "chore: merge upstream/$UPSTREAM_REF into ${{ steps.existing.outputs.branch }}"
+          git merge --squash "$UPSTREAM_SHA"
           MERGE_RC=$?
           set -e
 
@@ -195,9 +182,11 @@ jobs:
           done
           # ───────────────────────────────────────────────────────────────────
 
+          git add -A
+
           if [[ $MERGE_RC -ne 0 ]]; then
             # Conflicts after blocklist operations have been applied.
-            # If the only conflicts were in blocked paths they're gone now — clean merge.
+            # If the only conflicts were in blocked paths they're gone now — clean squash.
             CONFLICTS=$(git diff --name-only --diff-filter=U | grep -Ev "$SKIP_PATTERN" || true)
 
             if [[ -n "$CONFLICTS" ]]; then
@@ -206,39 +195,28 @@ jobs:
 
               # Commit the conflicted state so the PR diff shows what needs fixing.
               # CI will fail on this branch — that is intentional.
-              git add -A
-              git commit -m "chore: merge upstream/$UPSTREAM_REF [CONFLICTS — manual resolution required]"
+              git commit -m "chore: squash-merge upstream/$UPSTREAM_REF [CONFLICTS — manual resolution required]"
             else
               echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
               echo "conflict_files="     >> "$GITHUB_OUTPUT"
-              git add -A
-              git commit -m "chore: merge upstream/$UPSTREAM_REF"
+              git commit -m "chore: squash-merge upstream/$UPSTREAM_REF"
             fi
           else
             echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
             echo "conflict_files="     >> "$GITHUB_OUTPUT"
 
-            # Clean merge: blocklist ops may have staged changes — fold them into
-            # the merge commit to avoid a noisy extra commit on the branch.
             if ! git diff --cached --quiet; then
-              git commit --amend --no-edit
+              git commit -m "chore: squash-merge upstream/$UPSTREAM_REF"
+            else
+              echo "Nothing to commit — upstream is already in sync with main."
             fi
           fi
 
       - name: Check for new commits to push
         id: diff
         run: |
-          FOUND="${{ steps.existing.outputs.found }}"
-          BRANCH="${{ steps.existing.outputs.branch }}"
-
-          # Compare against the remote branch we started from
-          if [[ "$FOUND" == "true" ]]; then
-            BASE="origin/$BRANCH"
-          else
-            BASE="origin/main"
-          fi
-
-          COUNT=$(git rev-list --count "$BASE..HEAD")
+          # Always compare against origin/main since the branch is reset each run.
+          COUNT=$(git rev-list --count "origin/main..HEAD")
           echo "new_commits=$COUNT" >> "$GITHUB_OUTPUT"
           echo "Commits to push: $COUNT"
 
@@ -246,12 +224,10 @@ jobs:
         if: steps.diff.outputs.new_commits != '0'
         run: |
           BRANCH="${{ steps.existing.outputs.branch }}"
-          # --force-with-lease prevents overwriting commits pushed since we checked out
-          git push origin "$BRANCH" --force-with-lease
+          # --force because we always reset the branch to origin/main before squashing.
+          git push origin "$BRANCH" --force
 
       - name: Build PR body
-        # Always rebuild the description even if there's nothing new to push,
-        # so that the upstream SHA and timestamp stay current.
         run: |
           UPSTREAM_REF="${{ steps.meta.outputs.upstream_ref }}"
           UPSTREAM_SHA="${{ steps.meta.outputs.upstream_sha }}"
@@ -261,13 +237,20 @@ jobs:
           BRANCH="${{ steps.existing.outputs.branch }}"
           SYNC_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          COMMIT_LOG=$(git log --oneline "origin/main..HEAD" | head -30 || true)
-          COMMIT_COUNT=$(git rev-list --count "origin/main..HEAD" || echo 0)
+          # Show the upstream commits being squashed, not the single squash commit.
+          MERGE_BASE=$(git merge-base origin/main "$UPSTREAM_SHA" 2>/dev/null) || true
+          if [[ -n "$MERGE_BASE" ]]; then
+            UPSTREAM_LOG=$(git log --oneline "$MERGE_BASE..$UPSTREAM_SHA" | head -30 || true)
+            UPSTREAM_COUNT=$(git rev-list --count "$MERGE_BASE..$UPSTREAM_SHA" || echo 0)
+          else
+            UPSTREAM_LOG=""
+            UPSTREAM_COUNT="unknown"
+          fi
 
           {
             echo "## Upstream Sync"
             echo ""
-            echo "Merging [skypilot-org/skypilot](https://github.com/skypilot-org/skypilot)"
+            echo "Squash-merging [skypilot-org/skypilot](https://github.com/skypilot-org/skypilot)"
             echo "@ [\`$UPSTREAM_SHA_SHORT\`](https://github.com/skypilot-org/skypilot/commit/$UPSTREAM_SHA)"
             echo "into \`main\`."
             echo ""
@@ -275,12 +258,12 @@ jobs:
             echo "|---|---|"
             echo "| **Upstream ref** | \`$UPSTREAM_REF\` |"
             echo "| **Upstream SHA** | \`$UPSTREAM_SHA_SHORT\` |"
-            echo "| **Commits ahead of main** | $COMMIT_COUNT |"
+            echo "| **Upstream commits squashed** | $UPSTREAM_COUNT |"
             echo "| **Last synced** | $SYNC_TS |"
             echo ""
 
             if [[ "$HAS_CONFLICTS" == "true" ]]; then
-              echo "## ⚠️ Merge Conflicts — Do Not Merge Yet"
+              echo "## ⚠️ Conflicts — Do Not Merge Yet"
               echo ""
               echo "Conflict markers have been committed to this branch so the diff is"
               echo "visible in the PR. **CI will fail on this branch — that is expected.**"
@@ -299,24 +282,30 @@ jobs:
               echo "git checkout $BRANCH"
               echo "# Edit the conflicting files, remove all conflict markers (<<<<, ====, >>>>)"
               echo "git add <resolved-files>"
-              echo "git commit --amend  # or a new commit — either is fine"
-              echo "git push origin $BRANCH --force-with-lease"
+              echo "git commit --amend"
+              echo "git push origin $BRANCH --force"
               echo "\`\`\`"
+              echo ""
+              echo "> **Note:** The next scheduled sync run will reset this branch."
+              echo "> Merge the PR after resolving conflicts to avoid losing your work."
               echo "</details>"
             else
-              echo "## ✅ Clean Merge — Ready to Review"
+              echo "## ✅ Clean Squash — Ready to Review"
               echo ""
-              echo "No conflicts. Review the commits below and merge when CI passes."
+              echo "No conflicts. Review the diff below and merge when CI passes."
+              echo ""
+              echo "> **Note:** The next scheduled sync run will reset this branch to the"
+              echo "> latest upstream state. Merge before then to preserve any manual changes."
             fi
 
-            if [[ -n "$COMMIT_LOG" ]]; then
+            if [[ -n "$UPSTREAM_LOG" ]]; then
               echo ""
-              echo "## Commits included (vs \`main\`)"
+              echo "## Upstream commits squashed"
               echo ""
               echo "\`\`\`"
-              echo "$COMMIT_LOG"
-              if [[ "$COMMIT_COUNT" -gt 30 ]]; then
-                echo "... ($((COMMIT_COUNT - 30)) more)"
+              echo "$UPSTREAM_LOG"
+              if [[ "$UPSTREAM_COUNT" -gt 30 ]]; then
+                echo "... ($((UPSTREAM_COUNT - 30)) more)"
               fi
               echo "\`\`\`"
             fi
@@ -353,4 +342,4 @@ jobs:
       - name: No changes to sync
         if: steps.diff.outputs.new_commits == '0'
         run: |
-          echo "upstream/${{ steps.meta.outputs.upstream_ref }} has no new commits since last sync. Nothing to push."
+          echo "upstream/${{ steps.meta.outputs.upstream_ref }} is already in sync with main. Nothing to push."
