@@ -175,6 +175,10 @@ jobs:
             esc="${path//./\\.}"  # escape literal dots for grep -E
             SKIP_PATTERN="${SKIP_PATTERN}${SKIP_PATTERN:+|}^${esc}"
             if [[ "$op" == "restore" ]]; then
+              # Remove the entire path from index AND working tree first so that
+              # any extra files staged by the squash (e.g. upstream workflow files)
+              # are fully gone before we restore our version from origin/main.
+              git rm -r --ignore-unmatch "$path" 2>/dev/null || true
               git checkout origin/main -- "$path"
             else
               git rm --force --ignore-unmatch "$path"
