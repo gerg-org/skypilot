@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find .github/workflows -type f ! -name 'automerge.yml' ! -name 'upstream-sync.yml' -delete)"
+    ]
+  }
+}

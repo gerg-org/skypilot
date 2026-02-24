@@ -54,8 +54,10 @@ jobs:
         run: |
           UPSTREAM_REF="${{ github.event.inputs.upstream_ref || 'master' }}"
 
-          # Resolve the ref to a full SHA (supports branch, tag, or raw SHA)
+          # Resolve the ref to a full SHA.
+          # Branch refs live at upstream/<ref>; tag refs live at refs/tags/<ref>.
           UPSTREAM_SHA=$(git rev-parse "upstream/$UPSTREAM_REF" 2>/dev/null \
+            || git rev-parse "refs/tags/$UPSTREAM_REF" 2>/dev/null \
             || git rev-parse "$UPSTREAM_REF" 2>/dev/null \
             || { echo "::error::Could not resolve upstream ref '$UPSTREAM_REF'"; exit 1; })
           UPSTREAM_SHA_SHORT=$(git rev-parse --short "$UPSTREAM_SHA")
@@ -142,21 +144,59 @@ jobs:
           MERGE_RC=$?
           set -e
 
+          # ── Upstream blocklist ──────────────────────────────────────────────
+          # Files/dirs to drop or restore on every sync. Adding an entry here
+          # is the only edit needed — SKIP_PATTERN is derived automatically.
+          #
+          #   restore:<path>  reset path to our version from origin/main
+          #   delete:<path>   remove path entirely (we have no equivalent)
+          BLOCKLIST=(
+            "restore:.github/workflows/"
+            "delete:.github/dependabot.yml"
+          )
+
+          SKIP_PATTERN=""
+          for entry in "${BLOCKLIST[@]}"; do
+            op="${entry%%:*}"
+            path="${entry#*:}"
+            esc="${path//./\\.}"  # escape literal dots for grep -E
+            SKIP_PATTERN="${SKIP_PATTERN}${SKIP_PATTERN:+|}^${esc}"
+            if [[ "$op" == "restore" ]]; then
+              git checkout origin/main -- "$path"
+            else
+              git rm --force --ignore-unmatch "$path"
+            fi
+          done
+          # ───────────────────────────────────────────────────────────────────
+
           if [[ $MERGE_RC -ne 0 ]]; then
-            echo "has_conflicts=true" >> "$GITHUB_OUTPUT"
+            # Conflicts after blocklist operations have been applied.
+            # If the only conflicts were in blocked paths they're gone now — clean merge.
+            CONFLICTS=$(git diff --name-only --diff-filter=U | grep -Ev "$SKIP_PATTERN" || true)
 
-            # Capture conflicting file list before staging
-            CONFLICTS=$(git diff --name-only --diff-filter=U)
-            printf 'conflict_files<<CONFLICT_EOF\n%s\nCONFLICT_EOF\n' "$CONFLICTS" >> "$GITHUB_OUTPUT"
+            if [[ -n "$CONFLICTS" ]]; then
+              echo "has_conflicts=true" >> "$GITHUB_OUTPUT"
+              printf 'conflict_files<<CONFLICT_EOF\n%s\nCONFLICT_EOF\n' "$CONFLICTS" >> "$GITHUB_OUTPUT"
 
-            # Commit the conflicted state so the PR diff shows what needs fixing.
-            # CI will fail on this branch — that's intentional and clearly explained
-            # in the PR description. Resolve locally, then force-push.
-            git add -A
-            git commit -m "chore: merge upstream/$UPSTREAM_REF [CONFLICTS — manual resolution required]"
+              # Commit the conflicted state so the PR diff shows what needs fixing.
+              # CI will fail on this branch — that is intentional.
+              git add -A
+              git commit -m "chore: merge upstream/$UPSTREAM_REF [CONFLICTS — manual resolution required]"
+            else
+              echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
+              echo "conflict_files="     >> "$GITHUB_OUTPUT"
+              git add -A
+              git commit -m "chore: merge upstream/$UPSTREAM_REF"
+            fi
           else
             echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
             echo "conflict_files="     >> "$GITHUB_OUTPUT"
+
+            # Clean merge: blocklist ops may have staged changes — fold them into
+            # the merge commit to avoid a noisy extra commit on the branch.
+            if ! git diff --cached --quiet; then
+              git commit --amend --no-edit
+            fi
           fi
 
       - name: Check for new commits to push
