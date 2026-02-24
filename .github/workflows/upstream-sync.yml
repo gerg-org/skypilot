@@ -47,7 +47,10 @@ jobs:
       - name: Fetch upstream
         run: |
           git remote add upstream https://github.com/skypilot-org/skypilot.git
-          git fetch upstream --tags
+          # Two explicit fetches: branch heads (→ refs/remotes/upstream/*) then all tags.
+          # --force on tags overwrites any stale local tags with the same name.
+          git fetch upstream
+          git fetch upstream --tags --force
 
       - name: Compute metadata
         id: meta
@@ -55,18 +58,25 @@ jobs:
           UPSTREAM_REF="${{ github.event.inputs.upstream_ref || 'master' }}"
 
           # Resolve the ref to a full SHA.
-          # Try in order: remote-tracking branch, local tag, raw SHA.
-          # Each attempt uses || true so a 128 exit from git never kills the script.
+          # Primary: query the remote directly via ls-remote — works regardless of
+          # whether local ref resolution is set up correctly after the fetch.
+          # Fallback: local rev-parse (fast path for when refs are already available).
           UPSTREAM_SHA=""
-          UPSTREAM_SHA=$(git rev-parse "upstream/$UPSTREAM_REF" 2>/dev/null) || true
+          UPSTREAM_SHA=$(git ls-remote upstream \
+            "refs/tags/$UPSTREAM_REF" \
+            "refs/heads/$UPSTREAM_REF" \
+            2>/dev/null | awk 'NR==1{print $1}') || true
+
+          # If ls-remote came up empty (e.g. network blip), fall back to local refs.
+          if [[ -z "$UPSTREAM_SHA" ]]; then
+            UPSTREAM_SHA=$(git rev-parse "refs/remotes/upstream/$UPSTREAM_REF" 2>/dev/null) || true
+          fi
           if [[ -z "$UPSTREAM_SHA" ]]; then
             UPSTREAM_SHA=$(git rev-parse "refs/tags/$UPSTREAM_REF" 2>/dev/null) || true
           fi
+
           if [[ -z "$UPSTREAM_SHA" ]]; then
-            UPSTREAM_SHA=$(git rev-parse "$UPSTREAM_REF" 2>/dev/null) || true
-          fi
-          if [[ -z "$UPSTREAM_SHA" ]]; then
-            echo "::error::Could not resolve upstream ref '$UPSTREAM_REF' (tried upstream/<ref>, refs/tags/<ref>, raw SHA)"
+            echo "::error::Ref '$UPSTREAM_REF' not found in upstream (checked ls-remote, refs/remotes/upstream/<ref>, refs/tags/<ref>)"
             exit 1
           fi
           UPSTREAM_SHA_SHORT=$(git rev-parse --short "$UPSTREAM_SHA")
