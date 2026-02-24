@@ -25,20 +25,26 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  workflows: write
+  # NOTE: pushing commits that touch .github/workflows/ requires a PAT with the
+  # 'workflow' scope set as secrets.PAT. GITHUB_TOKEN cannot do this — GitHub
+  # blocks it at push time regardless of permissions declared here.
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Verify PAT is configured
+        run: |
+          if [[ -z "${{ secrets.PAT }}" ]]; then
+            echo "::error::secrets.PAT is not set. A PAT with 'repo' and 'workflow' scopes is required to push commits that modify .github/workflows/. GITHUB_TOKEN cannot do this."
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # Use PAT so commits and the PR are not attributed to the Actions bot,
-          # which can be blocked by branch-protection rules that require human authors.
-          # Fall back to GITHUB_TOKEN if PAT is not configured.
-          token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT }}
 
       - name: Configure git
         run: |
