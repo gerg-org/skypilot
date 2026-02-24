@@ -230,6 +230,8 @@ jobs:
           BRANCH="${{ steps.existing.outputs.branch }}"
           # --force because we always reset the branch to origin/main before squashing.
           git push origin "$BRANCH" --force
+          # Give GitHub a moment to index the new/updated branch before the PR API call.
+          sleep 3
 
       - name: Build PR body
         run: |
@@ -329,14 +331,18 @@ jobs:
           BRANCH="${{ steps.existing.outputs.branch }}"
           TITLE="${{ steps.meta.outputs.pr_title }}"
 
+          REPO="${{ github.repository }}"
+
           if [[ "$FOUND" == "true" ]]; then
             gh pr edit "$PR_NUMBER" \
+              --repo "$REPO" \
               --title "$TITLE" \
               --body-file /tmp/pr-body.md
             echo "Updated PR #$PR_NUMBER"
-            echo "  https://github.com/${{ github.repository }}/pull/$PR_NUMBER"
+            echo "  https://github.com/$REPO/pull/$PR_NUMBER"
           else
             gh pr create \
+              --repo "$REPO" \
               --base main \
               --head "$BRANCH" \
               --title "$TITLE" \
