@@ -1,0 +1,290 @@
+name: Upstream Sync
+
+# Creates (or updates) a PR that merges skypilot-org/skypilot into main.
+# The PR acts as a gate: review, run CI, then merge on your own schedule.
+#
+# Scheduled run:  syncs upstream/master weekly.
+# Manual run:     lets you choose a specific branch, tag, or SHA instead.
+#
+# The action reuses an existing open upstream-sync/* PR rather than creating
+# a new one each week, so rolling upstream commits accumulate in one place.
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: >
+          Upstream ref to sync (branch, tag, or SHA).
+          Leave blank to use master.
+        required: false
+        default: 'master'
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use PAT so commits and the PR are not attributed to the Actions bot,
+          # which can be blocked by branch-protection rules that require human authors.
+          # Fall back to GITHUB_TOKEN if PAT is not configured.
+          token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/skypilot-org/skypilot.git
+          git fetch upstream --tags
+
+      - name: Compute metadata
+        id: meta
+        run: |
+          UPSTREAM_REF="${{ github.event.inputs.upstream_ref || 'master' }}"
+
+          # Resolve the ref to a full SHA (supports branch, tag, or raw SHA)
+          UPSTREAM_SHA=$(git rev-parse "upstream/$UPSTREAM_REF" 2>/dev/null \
+            || git rev-parse "$UPSTREAM_REF" 2>/dev/null \
+            || { echo "::error::Could not resolve upstream ref '$UPSTREAM_REF'"; exit 1; })
+          UPSTREAM_SHA_SHORT=$(git rev-parse --short "$UPSTREAM_SHA")
+
+          TODAY=$(date -u +%Y-%m-%d)
+
+          if [[ "$UPSTREAM_REF" == "master" ]]; then
+            IS_MASTER=true
+            BRANCH_CANDIDATE="upstream-sync/$TODAY"
+            PR_TITLE="chore: sync upstream/master ($TODAY)"
+          else
+            IS_MASTER=false
+            # Sanitise slashes in tag names (e.g. release/v1.2.3 → release-v1.2.3)
+            SAFE_REF="${UPSTREAM_REF//\//-}"
+            BRANCH_CANDIDATE="upstream-sync/$SAFE_REF"
+            PR_TITLE="chore: sync upstream $UPSTREAM_REF"
+          fi
+
+          echo "upstream_ref=$UPSTREAM_REF"         >> "$GITHUB_OUTPUT"
+          echo "is_master=$IS_MASTER"               >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA"         >> "$GITHUB_OUTPUT"
+          echo "upstream_sha_short=$UPSTREAM_SHA_SHORT" >> "$GITHUB_OUTPUT"
+          echo "branch_candidate=$BRANCH_CANDIDATE" >> "$GITHUB_OUTPUT"
+          echo "pr_title=$PR_TITLE"                 >> "$GITHUB_OUTPUT"
+          echo "today=$TODAY"                       >> "$GITHUB_OUTPUT"
+
+      # Look for an existing open PR whose head branch starts with "upstream-sync/".
+      # For master syncs we reuse whatever branch is already open (accumulating
+      # upstream commits into a single PR). For tag syncs we match exactly.
+      - name: Find existing sync PR
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          IS_MASTER="${{ steps.meta.outputs.is_master }}"
+          BRANCH_CANDIDATE="${{ steps.meta.outputs.branch_candidate }}"
+
+          if [[ "$IS_MASTER" == "true" ]]; then
+            DATA=$(gh pr list --base main --state open --json number,headRefName \
+              --jq '[.[] | select(.headRefName | startswith("upstream-sync/"))] | first // {}')
+          else
+            DATA=$(gh pr list --base main --state open --json number,headRefName \
+              --jq --arg b "$BRANCH_CANDIDATE" \
+              '[.[] | select(.headRefName == $b)] | first // {}')
+          fi
+
+          PR_NUM=$(echo "$DATA"   | jq -r '.number      // empty')
+          PR_BRANCH=$(echo "$DATA" | jq -r '.headRefName // empty')
+
+          if [[ -n "$PR_NUM" ]]; then
+            echo "found=true"            >> "$GITHUB_OUTPUT"
+            echo "pr_number=$PR_NUM"     >> "$GITHUB_OUTPUT"
+            echo "branch=$PR_BRANCH"     >> "$GITHUB_OUTPUT"
+            echo "Reusing existing PR #$PR_NUM on branch $PR_BRANCH"
+          else
+            echo "found=false"                           >> "$GITHUB_OUTPUT"
+            echo "pr_number="                            >> "$GITHUB_OUTPUT"
+            echo "branch=$BRANCH_CANDIDATE"              >> "$GITHUB_OUTPUT"
+            echo "No existing sync PR found; will create branch $BRANCH_CANDIDATE"
+          fi
+
+      - name: Check out sync branch
+        run: |
+          FOUND="${{ steps.existing.outputs.found }}"
+          BRANCH="${{ steps.existing.outputs.branch }}"
+
+          if [[ "$FOUND" == "true" ]]; then
+            # Existing PR: start from the current state of the remote branch
+            git checkout -b "$BRANCH" "origin/$BRANCH"
+          else
+            # New PR: start from main so our custom changes are the base
+            git checkout -b "$BRANCH" origin/main
+          fi
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          UPSTREAM_SHA="${{ steps.meta.outputs.upstream_sha }}"
+          UPSTREAM_REF="${{ steps.meta.outputs.upstream_ref }}"
+
+          set +e
+          git merge "$UPSTREAM_SHA" --no-edit \
+            -m "chore: merge upstream/$UPSTREAM_REF into ${{ steps.existing.outputs.branch }}"
+          MERGE_RC=$?
+          set -e
+
+          if [[ $MERGE_RC -ne 0 ]]; then
+            echo "has_conflicts=true" >> "$GITHUB_OUTPUT"
+
+            # Capture conflicting file list before staging
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            printf 'conflict_files<<CONFLICT_EOF\n%s\nCONFLICT_EOF\n' "$CONFLICTS" >> "$GITHUB_OUTPUT"
+
+            # Commit the conflicted state so the PR diff shows what needs fixing.
+            # CI will fail on this branch — that's intentional and clearly explained
+            # in the PR description. Resolve locally, then force-push.
+            git add -A
+            git commit -m "chore: merge upstream/$UPSTREAM_REF [CONFLICTS — manual resolution required]"
+          else
+            echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
+            echo "conflict_files="     >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check for new commits to push
+        id: diff
+        run: |
+          FOUND="${{ steps.existing.outputs.found }}"
+          BRANCH="${{ steps.existing.outputs.branch }}"
+
+          # Compare against the remote branch we started from
+          if [[ "$FOUND" == "true" ]]; then
+            BASE="origin/$BRANCH"
+          else
+            BASE="origin/main"
+          fi
+
+          COUNT=$(git rev-list --count "$BASE..HEAD")
+          echo "new_commits=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Commits to push: $COUNT"
+
+      - name: Push sync branch
+        if: steps.diff.outputs.new_commits != '0'
+        run: |
+          BRANCH="${{ steps.existing.outputs.branch }}"
+          # --force-with-lease prevents overwriting commits pushed since we checked out
+          git push origin "$BRANCH" --force-with-lease
+
+      - name: Build PR body
+        # Always rebuild the description even if there's nothing new to push,
+        # so that the upstream SHA and timestamp stay current.
+        run: |
+          UPSTREAM_REF="${{ steps.meta.outputs.upstream_ref }}"
+          UPSTREAM_SHA="${{ steps.meta.outputs.upstream_sha }}"
+          UPSTREAM_SHA_SHORT="${{ steps.meta.outputs.upstream_sha_short }}"
+          HAS_CONFLICTS="${{ steps.merge.outputs.has_conflicts }}"
+          CONFLICT_FILES="${{ steps.merge.outputs.conflict_files }}"
+          BRANCH="${{ steps.existing.outputs.branch }}"
+          SYNC_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          COMMIT_LOG=$(git log --oneline "origin/main..HEAD" | head -30 || true)
+          COMMIT_COUNT=$(git rev-list --count "origin/main..HEAD" || echo 0)
+
+          {
+            echo "## Upstream Sync"
+            echo ""
+            echo "Merging [skypilot-org/skypilot](https://github.com/skypilot-org/skypilot)"
+            echo "@ [\`$UPSTREAM_SHA_SHORT\`](https://github.com/skypilot-org/skypilot/commit/$UPSTREAM_SHA)"
+            echo "into \`main\`."
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Upstream ref** | \`$UPSTREAM_REF\` |"
+            echo "| **Upstream SHA** | \`$UPSTREAM_SHA_SHORT\` |"
+            echo "| **Commits ahead of main** | $COMMIT_COUNT |"
+            echo "| **Last synced** | $SYNC_TS |"
+            echo ""
+
+            if [[ "$HAS_CONFLICTS" == "true" ]]; then
+              echo "## ⚠️ Merge Conflicts — Do Not Merge Yet"
+              echo ""
+              echo "Conflict markers have been committed to this branch so the diff is"
+              echo "visible in the PR. **CI will fail on this branch — that is expected.**"
+              echo "Resolve the conflicts below, then this PR is safe to merge."
+              echo ""
+              echo "**Conflicting files:**"
+              echo "\`\`\`"
+              echo "$CONFLICT_FILES"
+              echo "\`\`\`"
+              echo ""
+              echo "<details>"
+              echo "<summary>How to resolve locally</summary>"
+              echo ""
+              echo "\`\`\`bash"
+              echo "git fetch origin"
+              echo "git checkout $BRANCH"
+              echo "# Edit the conflicting files, remove all conflict markers (<<<<, ====, >>>>)"
+              echo "git add <resolved-files>"
+              echo "git commit --amend  # or a new commit — either is fine"
+              echo "git push origin $BRANCH --force-with-lease"
+              echo "\`\`\`"
+              echo "</details>"
+            else
+              echo "## ✅ Clean Merge — Ready to Review"
+              echo ""
+              echo "No conflicts. Review the commits below and merge when CI passes."
+            fi
+
+            if [[ -n "$COMMIT_LOG" ]]; then
+              echo ""
+              echo "## Commits included (vs \`main\`)"
+              echo ""
+              echo "\`\`\`"
+              echo "$COMMIT_LOG"
+              if [[ "$COMMIT_COUNT" -gt 30 ]]; then
+                echo "... ($((COMMIT_COUNT - 30)) more)"
+              fi
+              echo "\`\`\`"
+            fi
+
+            echo ""
+            echo "---"
+            echo "_Generated by the [upstream-sync workflow](../actions/workflows/upstream-sync.yml)._"
+          } > /tmp/pr-body.md
+
+      - name: Create or update PR
+        if: steps.diff.outputs.new_commits != '0'
+        env:
+          GH_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          FOUND="${{ steps.existing.outputs.found }}"
+          PR_NUMBER="${{ steps.existing.outputs.pr_number }}"
+          BRANCH="${{ steps.existing.outputs.branch }}"
+          TITLE="${{ steps.meta.outputs.pr_title }}"
+
+          if [[ "$FOUND" == "true" ]]; then
+            gh pr edit "$PR_NUMBER" \
+              --title "$TITLE" \
+              --body-file /tmp/pr-body.md
+            echo "Updated PR #$PR_NUMBER"
+            echo "  https://github.com/${{ github.repository }}/pull/$PR_NUMBER"
+          else
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "$TITLE" \
+              --body-file /tmp/pr-body.md
+          fi
+
+      - name: No changes to sync
+        if: steps.diff.outputs.new_commits == '0'
+        run: |
+          echo "upstream/${{ steps.meta.outputs.upstream_ref }} has no new commits since last sync. Nothing to push."
