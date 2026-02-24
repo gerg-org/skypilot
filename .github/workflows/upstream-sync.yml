@@ -55,11 +55,20 @@ jobs:
           UPSTREAM_REF="${{ github.event.inputs.upstream_ref || 'master' }}"
 
           # Resolve the ref to a full SHA.
-          # Branch refs live at upstream/<ref>; tag refs live at refs/tags/<ref>.
-          UPSTREAM_SHA=$(git rev-parse "upstream/$UPSTREAM_REF" 2>/dev/null \
-            || git rev-parse "refs/tags/$UPSTREAM_REF" 2>/dev/null \
-            || git rev-parse "$UPSTREAM_REF" 2>/dev/null \
-            || { echo "::error::Could not resolve upstream ref '$UPSTREAM_REF'"; exit 1; })
+          # Try in order: remote-tracking branch, local tag, raw SHA.
+          # Each attempt uses || true so a 128 exit from git never kills the script.
+          UPSTREAM_SHA=""
+          UPSTREAM_SHA=$(git rev-parse "upstream/$UPSTREAM_REF" 2>/dev/null) || true
+          if [[ -z "$UPSTREAM_SHA" ]]; then
+            UPSTREAM_SHA=$(git rev-parse "refs/tags/$UPSTREAM_REF" 2>/dev/null) || true
+          fi
+          if [[ -z "$UPSTREAM_SHA" ]]; then
+            UPSTREAM_SHA=$(git rev-parse "$UPSTREAM_REF" 2>/dev/null) || true
+          fi
+          if [[ -z "$UPSTREAM_SHA" ]]; then
+            echo "::error::Could not resolve upstream ref '$UPSTREAM_REF' (tried upstream/<ref>, refs/tags/<ref>, raw SHA)"
+            exit 1
+          fi
           UPSTREAM_SHA_SHORT=$(git rev-parse --short "$UPSTREAM_SHA")
 
           TODAY=$(date -u +%Y-%m-%d)
