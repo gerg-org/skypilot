@@ -360,11 +360,21 @@ spec:
           mountPath: /root/.runpod
           readOnly: true
         {{- end }}
+        {{- if .Values.cudoCredentials.enabled }}
+        - name: cudo-config
+          mountPath: /root/.config/cudo
+          readOnly: true
+        {{- end }}  
         {{- if .Values.digitaloceanCredentials.enabled }}
         - name: digitalocean-config
           mountPath: /root/.config/doctl
           readOnly: true
-        {{- end }}
+        {{- end }}              
+        {{- if .Values.ociCredentials.enabled }}
+        - name: oci-config
+          mountPath: /root/.oci
+          readOnly: true
+        {{- end }}         
         {{- if .Values.lambdaCredentials.enabled }}
         - name: lambda-config
           mountPath: /root/.lambda_cloud
@@ -384,6 +394,10 @@ spec:
         {{- end }}
       {{- if .Values.apiService.logs.retention.enabled }}
       - name: logrotate
+        {{- with .Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}      
         image: {{ include "common.image" (dict "root" . "image" .Values.apiService.image) }}
         command: ["/bin/sh", "-c"]
         # Warn if logrotate is missing in the image and keep the sidecar running
@@ -594,6 +608,38 @@ spec:
         - name: runpod-config
           mountPath: /root/.runpod
       {{- end }}
+      {{- if .Values.cudoCredentials.enabled }}
+      - name: create-cudo-credentials
+        {{- with .Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        image: {{ .Values.apiService.image }}
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo "Setting up CUDO credentials..."
+          if [ -n "$CUDO_CREDENTIALS" ]; then
+            echo "CUDO credentials found in environment variable."
+            mkdir -p /root/.config/cudo/
+            cat > /root/.config/cudo/cudo.yml <<EOF
+          $CUDO_CREDENTIALS
+          EOF
+          else
+            echo "CUDO credentials not found in environment variables. Skipping credentials setup."
+            echo "Sleeping for 10 minutes before exiting for debugging purposes."
+            sleep 600
+          fi
+        env:
+        - name: CUDO_CREDENTIALS
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.cudoCredentials.cudoSecretName }}
+              key: config
+        volumeMounts:
+        - name: cudo-config
+          mountPath: /root/.config/cudo
+      {{- end }}
       {{- if .Values.digitaloceanCredentials.enabled }}
       - name: create-digitalocean-credentials
         {{- with .Values.securityContext }}
@@ -625,7 +671,47 @@ spec:
         volumeMounts:
         - name: digitalocean-config
           mountPath: /.config/doctl
-      {{- end }}
+      {{- end }}      
+      {{- if .Values.ociCredentials.enabled }}
+      - name: create-oci-credentials
+        {{- with .Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        image: {{ .Values.apiService.image }}
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo "Setting up OCI credentials..."
+          if [ -n "$OCI_CREDENTIALS_CONFIG" ] && [ -n "$OCI_CREDENTIALS_KEY" ]; then
+            echo "OCI credentials found in environment variable."
+            mkdir -p /root/.oci
+            cat > /root/.oci/config <<EOF
+          $OCI_CREDENTIALS_CONFIG
+          EOF
+            cat > /root/.oci/oci_api_key.pem <<EOF
+          $OCI_CREDENTIALS_KEY
+          EOF
+          else
+            echo "OCI credentials not found in environment variables. Skipping credentials setup."
+            echo "Sleeping for 10 minutes before exiting for debugging purposes."
+            sleep 600
+          fi
+        env:
+        - name: OCI_CREDENTIALS_CONFIG
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.ociCredentials.ociSecretName }}
+              key: config
+        - name: OCI_CREDENTIALS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.ociCredentials.ociSecretName }}
+              key: key              
+        volumeMounts:
+        - name: oci-config
+          mountPath: /root/.oci
+      {{- end }}      
       {{- if .Values.lambdaCredentials.enabled }}
       - name: create-lambda-credentials
         {{- with .Values.securityContext }}
@@ -742,8 +828,16 @@ spec:
       - name: runpod-config
         emptyDir: {}
       {{- end }}
+      {{- if .Values.cudoCredentials.enabled }}
+      - name: cudo-config
+        emptyDir: {}
+      {{- end }}
       {{- if .Values.digitaloceanCredentials.enabled }}
       - name: digitalocean-config
+        emptyDir: {}
+      {{- end }}       
+      {{- if .Values.ociCredentials.enabled }}
+      - name: oci-config
         emptyDir: {}
       {{- end }}
       {{- if .Values.lambdaCredentials.enabled }}
