@@ -5,7 +5,7 @@ metadata:
 spec:
   endpointSelector:
     matchLabels:
-      io.cilium.k8s.policy.serviceaccount: skypilot
+      io.cilium.k8s.policy.serviceaccount: skypilot-api-sa
   egress:
   - toEndpoints:
     - matchLabels:
