@@ -1,7 +1,7 @@
 apiVersion: "cilium.io/v2"
 kind: CiliumNetworkPolicy
 metadata:
-  name: "allow-skypilot-egress-skypilot-db-cnpg"
+  name: "allow-skypilot-api-sa-egress-skypilot-db-cnpg"
 spec:
   endpointSelector:
     matchLabels:
