@@ -29,7 +29,7 @@ spec:
     initdb:
       database: skypilot-db
       secret:
-        name: cnpg-skypilot
+        name: cnpg-skypilot-db
 
   # Uncomment this and comment out the above to restore from the minio bucket
   # bootstrap:
