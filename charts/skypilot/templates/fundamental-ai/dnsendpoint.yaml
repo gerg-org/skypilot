@@ -8,4 +8,8 @@ spec:
     recordTTL: 180
     recordType: CNAME
     targets:
+    {{- if or (eq "prod" .Release.Namespace) (eq "dev" .Release.Namespace) }}
+    - "istio-ingressgateway-external.{{ .Values.istio.ingress.basedomain }}"
+    {{- else }}
     - "istio-ingressgateway-{{ .Values.istio.ingress.exposure | default "internal" }}.{{ .Values.istio.ingress.basedomain }}"
+    {{- end }}
