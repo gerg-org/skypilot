@@ -186,13 +186,18 @@ jobs:
           done
           # ───────────────────────────────────────────────────────────────────
 
+          if [[ $MERGE_RC -ne 0 ]]; then
+            # Capture unmerged files BEFORE `git add -A`, because staging
+            # resolves the unmerged state and bakes conflict markers into
+            # the index as regular content — making --diff-filter=U useless.
+            CONFLICTS=$(git diff --name-only --diff-filter=U | grep -Ev "$SKIP_PATTERN" || true)
+          else
+            CONFLICTS=""
+          fi
+
           git add -A
 
           if [[ $MERGE_RC -ne 0 ]]; then
-            # Conflicts after blocklist operations have been applied.
-            # If the only conflicts were in blocked paths they're gone now — clean squash.
-            CONFLICTS=$(git diff --name-only --diff-filter=U | grep -Ev "$SKIP_PATTERN" || true)
-
             if [[ -n "$CONFLICTS" ]]; then
               echo "has_conflicts=true" >> "$GITHUB_OUTPUT"
               printf 'conflict_files<<CONFLICT_EOF\n%s\nCONFLICT_EOF\n' "$CONFLICTS" >> "$GITHUB_OUTPUT"
