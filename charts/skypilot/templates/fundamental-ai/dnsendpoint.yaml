@@ -1,10 +1,18 @@
 apiVersion: externaldns.k8s.io/v1alpha1
 kind: DNSEndpoint
 metadata:
+    {{- if eq "prod" .Release.Namespace }}
+  name: {{ .Values.istio.ingress.prodDNSName }}
+    {{- else }}
   name: {{ .Values.istio.ingress.prefix }}{{ .Values.istio.ingress.host }}.{{ .Values.istio.ingress.basedomain }}
+    {{- end }}
 spec:
   endpoints:
+    {{- if eq "prod" .Release.Namespace }}
+  - dnsName: {{ .Values.istio.ingress.prodDNSName }}
+    {{- else }}
   - dnsName: {{ .Values.istio.ingress.prefix }}{{ .Values.istio.ingress.host }}.{{ .Values.istio.ingress.basedomain }}
+    {{- end }}
     recordTTL: 180
     recordType: CNAME
     targets:
