@@ -233,8 +233,8 @@ jobs:
         if: steps.diff.outputs.new_commits != '0'
         run: |
           BRANCH="${{ steps.existing.outputs.branch }}"
-          # Use GITHUB_TOKEN for the push — it can push workflow file changes
-          # without requiring the 'workflow' scope that a PAT would need.
+          # Use GITHUB_TOKEN for push — the PAT user may lack repo push access,
+          # and GITHUB_TOKEN inherently has contents:write in this repo.
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
           # --force because we always reset the branch to origin/main before squashing.
           git push origin "$BRANCH" --force
