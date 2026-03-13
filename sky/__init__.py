@@ -37,7 +37,11 @@ def _get_git_commit():
 
 
 __commit__ = _get_git_commit()
+<<<<<<< HEAD
 __version__ = '0.11.2'
+=======
+__version__ = '0.12.0rc1'
+>>>>>>> 9865d84f4d6a90ec628b5f224fedf7302bc99432
 __root_dir__ = directory_utils.get_sky_dir()
 
 
@@ -116,6 +120,7 @@ from sky.client.sdk import storage_ls
 from sky.client.sdk import stream_and_get
 from sky.client.sdk import tail_logs
 from sky.dag import Dag
+from sky.dag import DagExecution
 from sky.data import Storage
 from sky.data import StorageMode
 from sky.data import StoreType
@@ -153,6 +158,7 @@ Vsphere = clouds.Vsphere
 Fluidstack = clouds.Fluidstack
 Nebius = clouds.Nebius
 Hyperbolic = clouds.Hyperbolic
+Mithril = clouds.Mithril
 Shadeform = clouds.Shadeform
 Seeweb = clouds.Seeweb
 Yotta = clouds.Yotta
@@ -179,6 +185,7 @@ __all__ = [
     'Fluidstack',
     'Nebius',
     'Hyperbolic',
+    'Mithril',
     'Shadeform',
     'Seeweb',
     'Yotta',
@@ -196,6 +203,7 @@ __all__ = [
     'StatusRefreshMode',
     # APIs
     'Dag',
+    'DagExecution',
     'Task',
     'Resources',
     # core APIs

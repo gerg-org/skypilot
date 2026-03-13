@@ -146,7 +146,7 @@ TASK_ID_LIST_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}TASK_IDS'
 # cluster yaml is updated.
 #
 # TODO(zongheng,zhanghao): make the upgrading of skylet automatic?
-SKYLET_VERSION = '34'  # Add fields to ManagedJobInfo proto for GPU metrics.
+SKYLET_VERSION = '35'  # Add fields to ManagedJobInfo proto for handle.
 # The version of the lib files that skylet/jobs use. Whenever there is an API
 # change for the job_lib or log_lib, we need to bump this version, so that the
 # user can be notified to update their SkyPilot version on the remote cluster.
@@ -371,6 +371,11 @@ USER_ID_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}USER_ID'
 # runs on a VM launched by SkyPilot will be recognized as the same user.
 USER_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}USER'
 
+# The name for the environment variable that stores the client user hash.
+# This captures the machine-local identity of the actual client user, used to
+# aggregate usage across multiple API servers when basic auth is enabled.
+CLIENT_USER_HASH_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}CLIENT_USER_HASH'
+
 # SSH configuration to allow more concurrent sessions and connections.
 # Default MaxSessions is 10.
 # Default MaxStartups is 10:30:60, meaning:
@@ -487,6 +492,8 @@ OVERRIDEABLE_CONFIG_KEYS_IN_TASK: List[Tuple[str, ...]] = [
     ('kubernetes', 'dws'),
     ('kubernetes', 'kueue'),
     ('kubernetes', 'remote_identity'),
+    ('azure', 'remote_identity'),
+    ('azure', 'vpc_name'),
     ('gcp', 'managed_instance_group'),
     ('gcp', 'enable_gvnic'),
     ('gcp', 'enable_gpu_direct'),
@@ -517,6 +524,9 @@ SKIPPED_CLIENT_OVERRIDE_KEYS: List[Tuple[str, ...]] = [
     ('serve', 'controller', 'consolidation_mode'),
     ('jobs', 'controller', 'controller_logs_gc_retention_hours'),
     ('jobs', 'controller', 'task_logs_gc_retention_hours'),
+    # Slurm cluster configs (workdir, tmpdir, etc.) are admin-managed
+    # server-side settings and should not be overridden by clients.
+    ('slurm', 'cluster_configs'),
 ]
 
 # Constants for Azure blob storage
@@ -598,7 +608,7 @@ CATALOG_DIR = '~/.sky/catalogs'
 ALL_CLOUDS = ('aws', 'azure', 'gcp', 'ibm', 'lambda', 'scp', 'oci',
               'kubernetes', 'runpod', 'vast', 'vsphere', 'cudo', 'fluidstack',
               'paperspace', 'primeintellect', 'do', 'nebius', 'ssh', 'slurm',
-              'hyperbolic', 'seeweb', 'shadeform', 'yotta')
+              'hyperbolic', 'seeweb', 'shadeform', 'yotta', 'mithril')
 # END constants used for service catalog.
 
 # The user ID of the SkyPilot system.
@@ -649,6 +659,8 @@ MEMORY_SIZE_UNITS = {
     'pi': 2**50,
 }
 
+SUB_PATH_PATTERN = '^[a-zA-Z0-9._-][a-zA-Z0-9./_-]*$'
+
 MEMORY_SIZE_PATTERN = (
     '^[0-9]+('
     f'{"|".join([unit.lower() for unit in MEMORY_SIZE_UNITS])}|'
@@ -679,3 +691,6 @@ SLURM_PROCTRACK_TYPE_FILE = '.sky_proctrack_type'
 
 SSH_DISABLE_LATENCY_MEASUREMENT_ENV_VAR = (
     f'{SKYPILOT_ENV_VAR_PREFIX}SSH_DISABLE_LATENCY_MEASUREMENT')
+
+# Maximum number of node name entries to keep per node in the lineage.
+MAX_NODE_NAME_LINEAGE = 10
