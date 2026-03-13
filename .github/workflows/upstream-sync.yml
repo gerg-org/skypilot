@@ -233,10 +233,15 @@ jobs:
         if: steps.diff.outputs.new_commits != '0'
         run: |
           BRANCH="${{ steps.existing.outputs.branch }}"
+          # Use GITHUB_TOKEN for the push — it can push workflow file changes
+          # without requiring the 'workflow' scope that a PAT would need.
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
           # --force because we always reset the branch to origin/main before squashing.
           git push origin "$BRANCH" --force
           # Give GitHub a moment to index the new/updated branch before the PR API call.
           sleep 3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build PR body
         run: |
