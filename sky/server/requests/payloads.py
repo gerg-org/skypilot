@@ -85,6 +85,10 @@ def request_body_env_vars() -> dict:
     env_vars[constants.USER_ENV_VAR] = common_utils.get_local_user_name()
     env_vars[
         usage_constants.USAGE_RUN_ID_ENV_VAR] = usage_lib.messages.usage.run_id
+    # Send client user hash for basic auth at API server case, so the server
+    # can include it in its own usage report.
+    if common.basic_auth_enabled and common.client_user_hash is not None:
+        env_vars[constants.CLIENT_USER_HASH_ENV_VAR] = common.client_user_hash
     if not common.is_api_server_local():
         # Used in job controller, for local API server, keep the
         # SKYPILOT_CONFIG env var to use the config for the managed job.
@@ -195,6 +199,12 @@ class CheckBody(RequestBody):
 class EnabledCloudsBody(RequestBody):
     """The request body for the enabled clouds endpoint."""
     workspace: Optional[str] = None
+    expand: bool = False
+
+
+class EnabledCloudsBatchBody(RequestBody):
+    """The request body for the batch enabled clouds endpoint."""
+    workspaces: List[str]
     expand: bool = False
 
 
@@ -586,6 +596,8 @@ class JobsCancelBody(RequestBody):
     all: bool = False
     all_users: bool = False
     pool: Optional[str] = None
+    graceful: bool = False
+    graceful_timeout: Optional[int] = None
 
 
 class JobsLogsBody(RequestBody):
@@ -613,6 +625,7 @@ class RequestStatusBody(pydantic.BaseModel):
     all_status: bool = False
     limit: Optional[int] = None
     fields: Optional[List[str]] = None
+    cluster_name: Optional[str] = None
 
 
 class ServeUpBody(RequestBody):
