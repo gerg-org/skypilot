@@ -582,6 +582,13 @@ vastCredentials:
   # Name of the secret containing the Vast credentials. Only used if enabled is true.
   vastSecretName: vast-credentials
 
+# Populate Prime Intellect credentials from the secret with key `config.json`
+primeintellectCredentials:
+  enabled: false
+  # Name of the secret containing the Prime Intellect credentials. Only used if enabled is true.
+  # The secret must have a key named `config.json` containing the full credentials JSON.
+  primeintellectSecretName: primeintellect-credentials
+
 # Populate Nebius credentials from the secret with nebius credentials.
 nebiusCredentials:
   enabled: false
