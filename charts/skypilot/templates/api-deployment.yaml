@@ -385,6 +385,11 @@ spec:
           mountPath: /root/.config/vastai
           readOnly: true
         {{- end }}
+        {{- if .Values.primeintellectCredentials.enabled }}
+        - name: primeintellect-config
+          mountPath: /root/.prime
+          readOnly: true
+        {{- end }}
         {{- if .Values.nebiusCredentials.enabled }}
         - name: nebius-credentials
           mountPath: /root/.nebius_credentials
@@ -778,6 +783,29 @@ spec:
         - name: vast-config
           mountPath: /root/.config/vastai
       {{- end }}
+      {{- if .Values.primeintellectCredentials.enabled }}
+      - name: setup-primeintellect-credentials
+        {{- with .Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        image: {{ include "common.image" (dict "root" . "image" .Values.apiService.image) }}
+        command: ["/bin/sh", "-c"]
+        {{- if $.Values.global.extraEnvs }}
+        env:
+        {{- with $.Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- end }}
+        args:
+        - |
+          cp /root/.prime_credentials/* /root/.prime/
+        volumeMounts:
+        - name: primeintellect-credentials
+          mountPath: /root/.prime_credentials
+        - name: primeintellect-config
+          mountPath: /root/.prime
+      {{- end }}
       {{- if .Values.extraInitContainers }}
       {{- toYaml .Values.extraInitContainers | nindent 6 }}
       {{- end }}
@@ -846,6 +874,13 @@ spec:
       {{- end }}
       {{- if .Values.vastCredentials.enabled }}
       - name: vast-config
+        emptyDir: {}
+      {{- end }}
+      {{- if .Values.primeintellectCredentials.enabled }}
+      - name: primeintellect-credentials
+        secret:
+          secretName: {{ .Values.primeintellectCredentials.primeintellectSecretName }}
+      - name: primeintellect-config
         emptyDir: {}
       {{- end }}
       {{- if .Values.nebiusCredentials.enabled }}
