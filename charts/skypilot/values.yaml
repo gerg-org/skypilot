@@ -584,7 +584,7 @@ vastCredentials:
 
 # Populate Prime Intellect credentials from the secret with key `config.json`
 primeintellectCredentials:
-  enabled: false
+  enabled: true
   # Name of the secret containing the Prime Intellect credentials. Only used if enabled is true.
   # The secret must have a key named `config.json` containing the full credentials JSON.
   primeintellectSecretName: primeintellect-credentials
