@@ -2667,8 +2667,6 @@ def test_job_group_primary_failure_immediate_termination(generic_cloud: str):
 
 
 @pytest.mark.managed_jobs
-<<<<<<< HEAD
-=======
 @pytest.mark.no_hyperbolic  # Hyperbolic doesn't support host controllers
 @pytest.mark.no_shadeform  # Shadeform does not support host controllers
 def test_managed_job_node_names_single_node(generic_cloud: str):
@@ -2736,7 +2734,6 @@ def test_managed_job_node_names_multi_node(generic_cloud: str):
 
 
 @pytest.mark.managed_jobs
->>>>>>> 8944d85a2ee18f8db24f2fa0657a496ed0f77edf
 @pytest.mark.no_remote_server
 def test_managed_jobs_log_tail_cleanup(generic_cloud: str):
     """Test that stream_logs processes are cleaned up on client disconnect.
@@ -2847,8 +2844,6 @@ def test_managed_jobs_log_tail_cleanup(generic_cloud: str):
         timeout=20 * 60,
     )
     smoke_tests_utils.run_one_test(test)
-<<<<<<< HEAD
-=======
 
 
 @pytest.mark.managed_jobs
@@ -2942,4 +2937,3 @@ def test_managed_jobs_api_access(generic_cloud: str):
         timeout=30 * 60,
     )
     smoke_tests_utils.run_one_test(test)
->>>>>>> 8944d85a2ee18f8db24f2fa0657a496ed0f77edf

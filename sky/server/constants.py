@@ -103,8 +103,6 @@ OAUTH2_PROXY_ENABLED_ENV_VAR = 'SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED'
 # The env vars are read by websockets at import time.
 WEBSOCKETS_MAX_HEADER_LINE_LENGTH = '65536'
 WEBSOCKETS_MAX_NUM_HEADERS = '256'
-<<<<<<< HEAD
-=======
 
 # Request logs are stored in ~/.sky/api_server/request_logs/ to avoid NFS
 # performance issues in Kubernetes deployments where ~/sky_logs/ may be on
@@ -120,4 +118,3 @@ DEFAULT_DAEMON_LOG_MAX_BYTES = 128 * 1024 * 1024  # 128 MB
 # Interval for the server-side heartbeat daemon that sends plugin metrics
 # to Loki (e.g., GPU inventory from billing plugin).
 SERVER_HEARTBEAT_INTERVAL_SECONDS = 600  # 10 minutes
->>>>>>> 8944d85a2ee18f8db24f2fa0657a496ed0f77edf
