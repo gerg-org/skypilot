@@ -89,6 +89,11 @@ Below is the configuration syntax and some example values.  See details under ea
     /checkpoints:
       source: s3://existing-bucket
       mode: MOUNT
+    # Mount with VFS caching and a pre-tuned workload type
+    /data:
+      source: s3://my-model-data
+      mode: MOUNT_CACHED
+      type: DATASET_RO
     /datasets-s3: s3://my-awesome-dataset
 
   :ref:`setup <yaml-spec-setup>`: |
@@ -676,7 +681,7 @@ OR
 ~~~~~~~~~~~~~~~~~~~~~~
 Custom image id (optional, advanced).
 
-The image id used to boot the instances. Only supported for AWS, GCP, OCI and IBM (for non-docker image).
+The image id used to boot the instances. Only supported for AWS, GCP, OCI, IBM and Verda. IBM and Verda only support non-docker images.
 
 If not specified, SkyPilot will use the default debian-based image suitable for machine learning tasks.
 
@@ -1076,9 +1081,15 @@ Example:
     /datasets-storage:
       name: sky-dataset  # Name of storage, optional when source is bucket URI
       source: /local/path/datasets  # Source path, can be local or bucket URI. Optional, do not specify to create an empty bucket.
-      store: s3  # Could be either 's3', 'gcs', 'azure', 'r2', 'oci', or 'ibm'; default: None. Optional.
+      store: s3  # Could be either 's3', 'gcs', 'azure', 'r2', 'vastdata', 'oci', or 'ibm'; default: None. Optional.
       persistent: True  # Defaults to True; can be set to false to delete bucket after cluster is downed. Optional.
       mode: MOUNT  # MOUNT or COPY or MOUNT_CACHED. Defaults to MOUNT. Optional.
+
+    # Mount with VFS caching and a pre-tuned workload type for model checkpoints.
+    /checkpoints:
+      source: s3://my-checkpoint-bucket
+      mode: MOUNT_CACHED
+      type: MODEL_CHECKPOINT_RW  # Pre-tuned workload type. Optional.
 
     # Copies a cloud object store URI to the cluster. Can be private buckets.
     /datasets-s3: s3://my-awesome-dataset
@@ -1094,13 +1105,21 @@ OR
 .. code-block:: yaml
 
   file_mounts:
-    /remote/data: ./local_data  # Local to remote
+    /remote/config: ./local_config  # Local to remote
     /remote/output: s3://my-bucket/outputs  # Cloud storage
     /remote/models:
       name: my-models-bucket
       source: ~/local_models
       store: gcs
       mode: MOUNT
+    /remote/data:
+      source: gs://my-data-bucket
+      mode: MOUNT_CACHED
+      type: DATASET_RO
+
+The ``type`` field specifies a pre-tuned workload type for ``MOUNT_CACHED`` mode.
+Available types: ``MODEL_CHECKPOINT_RO``, ``MODEL_CHECKPOINT_RW``, ``DATASET_RO``, ``DATASET_RW``.
+See :ref:`mount_cached_workload_types` for details on workload types and ``config.mount_cached`` parameters.
 
 .. _yaml-spec-setup:
 
@@ -1452,3 +1471,125 @@ Port to run your service on each replica.
 
   resources:
     ports: 8080
+
+.. _pool-yaml-spec:
+
+Job Pools
+=========
+
+To define a YAML for use with :ref:`job pools <pool>`, use previously mentioned fields to describe each worker, then add a pool section to configure the pool's scaling behavior.
+
+Syntax
+
+.. parsed-literal::
+
+  pool:
+    :ref:`workers <yaml-spec-pool-workers>`: 3
+
+  pool:
+    :ref:`min_workers <yaml-spec-pool-min-workers>`: 1
+    :ref:`max_workers <yaml-spec-pool-max-workers>`: 10
+    :ref:`queue_length_threshold <yaml-spec-pool-queue-length-threshold>`: 5
+    :ref:`upscale_delay_seconds <yaml-spec-pool-upscale-delay-seconds>`: 300
+    :ref:`downscale_delay_seconds <yaml-spec-pool-downscale-delay-seconds>`: 1200
+
+
+Fields
+----------
+
+.. _yaml-spec-pool-workers:
+
+``pool.workers``
+~~~~~~~~~~~~~~~~
+
+Number of workers in the pool.
+
+If ``min_workers`` and ``max_workers`` are not specified, the pool maintains a fixed number of workers with no autoscaling. If autoscaling is enabled (``min_workers``/``max_workers`` are set), this serves as the initial number of workers.
+
+.. code-block:: yaml
+
+  pool:
+    workers: 3
+
+
+.. _yaml-spec-pool-min-workers:
+
+``pool.min_workers``
+~~~~~~~~~~~~~~~~~~~~
+
+Minimum number of workers when autoscaling is enabled (required with ``max_workers``).
+
+The pool never scales below this count. Setting to ``0`` enables **scale-to-zero**: the pool terminates all workers when idle, and provisions workers automatically when new jobs are submitted.
+
+.. code-block:: yaml
+
+  pool:
+    min_workers: 1
+    max_workers: 10
+
+
+.. _yaml-spec-pool-max-workers:
+
+``pool.max_workers``
+~~~~~~~~~~~~~~~~~~~~
+
+Maximum number of workers when autoscaling is enabled (required with ``min_workers``).
+
+The pool never scales above this count. Must be greater than or equal to ``min_workers``.
+
+.. code-block:: yaml
+
+  pool:
+    min_workers: 1
+    max_workers: 10
+
+
+.. _yaml-spec-pool-queue-length-threshold:
+
+``pool.queue_length_threshold``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Number of pending jobs that triggers upscaling (default: 1).
+
+When the number of pending jobs exceeds this threshold, the pool scales up. Requires ``max_workers`` to be set.
+
+.. code-block:: yaml
+
+  pool:
+    min_workers: 1
+    max_workers: 10
+    queue_length_threshold: 5
+
+
+.. _yaml-spec-pool-upscale-delay-seconds:
+
+``pool.upscale_delay_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Delay in seconds between upscaling decisions (default: 300).
+
+Controls how frequently the pool evaluates whether to add workers.
+
+.. code-block:: yaml
+
+  pool:
+    min_workers: 1
+    max_workers: 10
+    upscale_delay_seconds: 60
+
+
+.. _yaml-spec-pool-downscale-delay-seconds:
+
+``pool.downscale_delay_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Delay in seconds between downscaling decisions (default: 1200).
+
+Controls how frequently the pool evaluates whether to remove workers.
+
+.. code-block:: yaml
+
+  pool:
+    min_workers: 1
+    max_workers: 10
+    downscale_delay_seconds: 600
