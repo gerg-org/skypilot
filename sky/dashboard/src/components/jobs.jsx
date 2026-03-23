@@ -148,6 +148,10 @@ export function getAggregatedStatus(tasks) {
 // Define filter options for the filter dropdown
 const PROPERTY_OPTIONS = [
   {
+    label: 'ID',
+    value: 'id',
+  },
+  {
     label: 'Name',
     value: 'name',
   },
@@ -330,6 +334,7 @@ export function ManagedJobs() {
   const updateFiltersByURLParams = React.useCallback(() => {
     const propertyMap = new Map();
     propertyMap.set('', '');
+    propertyMap.set('id', 'ID');
     propertyMap.set('status', 'Status');
     propertyMap.set('name', 'Name');
     propertyMap.set('user', 'User');
@@ -542,8 +547,10 @@ export function ManagedJobsTable({
         };
 
         // Build params for jobsCacheManager
+        const jobIdFilter = getFilterValue('id');
         const params = {
           allUsers: true,
+          jobIdMatch: jobIdFilter,
           nameMatch: getFilterValue('name'),
           userMatch: getFilterValue('user'),
           workspaceMatch: getFilterValue('workspace'),
@@ -1622,8 +1629,8 @@ export function ManagedJobsTable({
     <div className="relative">
       <div className="flex flex-col space-y-1 mb-1">
         {/* Combined Status Filter */}
-        <div className="flex flex-wrap items-center justify-between text-sm mb-1">
-          <div className="flex flex-wrap items-center">
+        <div className="flex items-center justify-between text-sm mb-1">
+          <div className="flex flex-wrap items-center min-w-0">
             <span className="mr-2 text-sm font-medium">Statuses:</span>
             <div className="flex flex-wrap gap-2 items-center">
               {!loading && totalNoFilter === 0 && !isInitialLoad && (
@@ -1715,7 +1722,7 @@ export function ManagedJobsTable({
               )}
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0 ml-2">
             {loading && (
               <div className="flex items-center">
                 <CircularProgress size={15} className="mt-0" />

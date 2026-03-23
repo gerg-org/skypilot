@@ -380,9 +380,8 @@ def up(
                 backend.cancel_jobs(controller_handle, [controller_job_id])
                 with ux_utils.print_exception_no_traceback():
                     raise RuntimeError(
-                        'Max number of services reached. '
-                        'To spin up more services, please '
-                        'tear down some existing services.') from None
+                        controller_utils.get_max_services_error_message(
+                            pool)) from None
             else:
                 # Possible cases:
                 # (1) name conflict;
@@ -418,19 +417,20 @@ def up(
                 f'{fore.CYAN}Pool name: '
                 f'{style.BRIGHT}{service_name}{style.RESET_ALL}'
                 f'\n📋 Useful Commands'
-                f'\n{ux_utils.INDENT_SYMBOL}To submit jobs to the pool:\t'
+                f'\n{ux_utils.INDENT_SYMBOL}To submit jobs to the pool:\t\t'
                 f'{ux_utils.BOLD}sky jobs launch --pool {service_name} '
                 f'<yaml_file>{ux_utils.RESET_BOLD}'
-                f'\n{ux_utils.INDENT_SYMBOL}To submit multiple jobs:\t'
+                f'\n{ux_utils.INDENT_SYMBOL}To submit multiple jobs:\t\t'
                 f'{ux_utils.BOLD}sky jobs launch --pool {service_name} '
                 f'--num-jobs 10 <yaml_file>{ux_utils.RESET_BOLD}'
-                f'\n{ux_utils.INDENT_SYMBOL}To check the pool status:\t'
+                f'\n{ux_utils.INDENT_SYMBOL}To check the pool status:\t\t'
                 f'{ux_utils.BOLD}sky jobs pool status {service_name}'
                 f'{ux_utils.RESET_BOLD}'
-                f'\n{ux_utils.INDENT_LAST_SYMBOL}To terminate the pool:\t'
+                f'\n{ux_utils.INDENT_SYMBOL}To terminate the pool:\t\t'
                 f'{ux_utils.BOLD}sky jobs pool down {service_name}'
                 f'{ux_utils.RESET_BOLD}'
-                f'\n{ux_utils.INDENT_SYMBOL}To update the number of workers:\t'
+                f'\n{ux_utils.INDENT_LAST_SYMBOL}'
+                'To update the number of workers:\t'
                 f'{ux_utils.BOLD}sky jobs pool apply --pool {service_name} '
                 f'--workers 5{ux_utils.RESET_BOLD}'
                 '\n\n' + ux_utils.finishing_message('Successfully created pool '
