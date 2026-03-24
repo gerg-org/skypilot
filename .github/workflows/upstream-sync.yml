@@ -161,11 +161,17 @@ jobs:
           # Files/dirs to drop or restore on every sync. Adding an entry here
           # is the only edit needed — SKIP_PATTERN is derived automatically.
           #
-          #   restore:<path>  reset path to our version from origin/main
-          #   delete:<path>   remove path entirely (we have no equivalent)
+          #   restore:<path>   reset path to our version from origin/main
+          #   upstream:<path>  accept upstream version unconditionally (resolves conflicts)
+          #   delete:<path>    remove path entirely (we have no equivalent)
           BLOCKLIST=(
             "restore:.github/workflows/"
             "delete:.github/dependabot.yml"
+            # Files that routinely conflict but have no fork-specific changes —
+            # always accept upstream to avoid baking in conflict markers.
+            "upstream:sky/__init__.py"
+            "upstream:docs/source/images/"
+            "upstream:tests/"
           )
 
           SKIP_PATTERN=""
@@ -180,6 +186,11 @@ jobs:
               # are fully gone before we restore our version from origin/main.
               git rm -r --ignore-unmatch "$path" 2>/dev/null || true
               git checkout origin/main -- "$path"
+            elif [[ "$op" == "upstream" ]]; then
+              # Accept the upstream version wholesale — resolves any conflicts
+              # in these paths by overwriting with what upstream has.
+              git rm -r --ignore-unmatch "$path" 2>/dev/null || true
+              git checkout "$UPSTREAM_SHA" -- "$path" 2>/dev/null || true
             else
               git rm --force --ignore-unmatch "$path"
             fi
