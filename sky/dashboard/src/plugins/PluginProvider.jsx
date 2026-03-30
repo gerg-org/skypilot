@@ -744,6 +744,8 @@ function createPluginApi(dispatch) {
         id: String(config.id),
         name: config.name || config.id,
         useHook: config.useHook,
+        hooks: config.hooks || {},
+        components: config.components || {},
       };
       dispatch({
         type: actions.REGISTER_DATA_PROVIDER,
@@ -763,6 +765,26 @@ export function PluginProvider({ children }) {
   const router = useRouter();
   const routerRef = useRef(router);
   const pluginsLoadedRef = useRef(false);
+<<<<<<< HEAD
+
+  // Keep router ref up to date
+  useEffect(() => {
+    routerRef.current = router;
+  }, [router]);
+
+  // Expose router reference for plugin API navigate()
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.__pluginRouterRef = routerRef;
+      return () => {
+        if (window.__pluginRouterRef === routerRef) {
+          delete window.__pluginRouterRef;
+        }
+      };
+    }
+  }, []);
+=======
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
 
   // Keep router ref up to date
   useEffect(() => {
@@ -781,17 +803,33 @@ export function PluginProvider({ children }) {
     }
   }, []);
 
-  // Expose state reference for getDataEnhancements to access outside React context
+  // Expose state reference for plugins to access outside React context.
+  // Use a stable ref updated during render (not in useEffect) so that child
+  // components' effects always read the latest state — even on the same commit
+  // that first mounts them.  The previous approach (useEffect with [state] dep)
+  // deleted and recreated __pluginStateRef on every state change; because React
+  // runs all cleanups before all new effects (children-first), a child mounting
+  // on the same render would read undefined during its effect.
+  const pluginStateRef = useRef(state);
+  pluginStateRef.current = state;
+
   useEffect(() => {
     if (typeof window !== 'undefined') {
-      window.__pluginStateRef = { current: state };
+      window.__pluginStateRef = pluginStateRef;
       return () => {
-        if (window.__pluginStateRef) {
+        if (window.__pluginStateRef === pluginStateRef) {
           delete window.__pluginStateRef;
         }
       };
     }
-  }, [state]);
+  }, []);
+
+  // Persist nav links to localStorage after plugins have fully loaded
+  useEffect(() => {
+    if (pluginsLoadedRef.current) {
+      saveCachedNavLinks(state.topNavLinks);
+    }
+  }, [state.topNavLinks]);
 
   // Persist nav links to localStorage after plugins have fully loaded
   useEffect(() => {
@@ -840,6 +878,13 @@ export function PluginProvider({ children }) {
       if (!cancelled) {
         pluginsLoadedRef.current = true;
         dispatch({ type: actions.CLEAR_CACHED_NAV_LINKS });
+<<<<<<< HEAD
+=======
+        // Signal that all plugin scripts have finished loading.
+        // layout.jsx listens for this to avoid showing the fallback top bar
+        // before the sidebar plugin has had a chance to register.
+        window.dispatchEvent(new CustomEvent('skydashboard:plugins-loaded'));
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
       }
     };
     void bootstrapPlugins();

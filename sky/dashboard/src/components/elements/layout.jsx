@@ -10,6 +10,13 @@ import {
 } from '@/hooks/useUpgradeDetection';
 import { installUpgradeInterceptor } from '@/utils/apiInterceptor';
 import { PluginSlot } from '@/plugins/PluginSlot';
+<<<<<<< HEAD
+=======
+import {
+  EVENT_NAVIGATION_READY,
+  EVENT_PLUGINS_LOADED,
+} from '@/data/connectors/constants';
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
 
 function DefaultNavbarLayout({ children }) {
   return (
@@ -40,6 +47,7 @@ function LayoutContent({ children, highlighted }) {
     installUpgradeInterceptor(reportUpgrade, clearUpgrade);
   }, [reportUpgrade, clearUpgrade]);
 
+<<<<<<< HEAD
   // Wait briefly for navigation plugins to register before showing layout.
   // A navigation plugin (e.g. sidebar) dispatches 'skydashboard:navigation-ready'
   // to cut the wait short. Otherwise we fall back after a timeout.
@@ -50,6 +58,26 @@ function LayoutContent({ children, highlighted }) {
     return () => {
       clearTimeout(timer);
       window.removeEventListener('skydashboard:navigation-ready', handler);
+=======
+  // Wait for navigation plugins to register before showing layout.
+  // A navigation plugin (e.g. sidebar) dispatches 'skydashboard:navigation-ready'
+  // to cut the wait short. Otherwise we wait until all plugin scripts have
+  // finished loading ('skydashboard:plugins-loaded') so the sidebar plugin has
+  // a chance to register before falling back to the default top bar.
+  // A safety timeout prevents blocking indefinitely if plugin loading hangs.
+  useEffect(() => {
+    const timer = setTimeout(() => setPluginsSettled(true), 1000);
+    const handler = () => {
+      clearTimeout(timer);
+      setPluginsSettled(true);
+    };
+    window.addEventListener(EVENT_NAVIGATION_READY, handler, { once: true });
+    window.addEventListener(EVENT_PLUGINS_LOADED, handler, { once: true });
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener(EVENT_NAVIGATION_READY, handler);
+      window.removeEventListener(EVENT_PLUGINS_LOADED, handler);
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
     };
   }, []);
 

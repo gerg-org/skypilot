@@ -75,10 +75,20 @@ def get_default_instance_type(
     local_disk: Optional[str] = None,
     region: Optional[str] = None,
     zone: Optional[str] = None,
+<<<<<<< HEAD
 ) -> Optional[str]:
     del disk_tier, local_disk  # Unused
     return common.get_instance_type_for_cpus_mem_impl(_df, cpus, memory, region,
                                                       zone)
+=======
+    use_spot: bool = False,
+    max_hourly_cost: Optional[float] = None,
+) -> Optional[str]:
+    del disk_tier, local_disk  # Unused
+    return common.get_instance_type_for_cpus_mem_impl(_df, cpus, memory, region,
+                                                      zone, use_spot,
+                                                      max_hourly_cost)
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
 
 
 def get_instance_type_for_accelerator(
@@ -90,6 +100,10 @@ def get_instance_type_for_accelerator(
     local_disk: Optional[str] = None,
     region: Optional[str] = None,
     zone: Optional[str] = None,
+<<<<<<< HEAD
+=======
+    max_hourly_cost: Optional[float] = None,
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
 ) -> Tuple[Optional[List[str]], List[str]]:
     """Filter the instance types based on resource requirements.
 
@@ -109,6 +123,10 @@ def get_instance_type_for_accelerator(
         use_spot=use_spot,
         region=region,
         zone=zone,
+<<<<<<< HEAD
+=======
+        max_hourly_cost=max_hourly_cost,
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
     )
 
 

@@ -360,7 +360,11 @@ def override_request_env_and_config(
         request_body.env_vars.pop(constants.ENV_VAR_DB_CONNECTION_URI, None)
         # Remove the in-cluster context name from client supplied env vars.
         # When a client runs inside a Kubernetes pod (e.g., a managed job with
+<<<<<<< HEAD
         # api_access), its env has SKYPILOT_IN_CLUSTER_CONTEXT_NAME set by the
+=======
+        # api_server_access), its env has SKYPILOT_IN_CLUSTER_CONTEXT_NAME set
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
         # pod template. If this leaks into the server's os.environ, it causes
         # the server to attempt in-cluster auth (load_incluster_config) instead
         # of using its own kubeconfig, which fails when the server is not
