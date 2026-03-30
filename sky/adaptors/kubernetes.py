@@ -281,6 +281,10 @@ class RetryableClientWrapper:
         if not callable(attr):
             return attr
 
+<<<<<<< HEAD
+=======
+        @functools.wraps(attr)
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
         def with_refresh(*args, **kwargs):
             if self._should_refresh():
                 with self._refresh_lock:

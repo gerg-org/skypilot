@@ -121,6 +121,11 @@ class Mithril(clouds.Cloud):
         local_disk: Optional[str] = None,
         region: Optional[str] = None,
         zone: Optional[str] = None,
+<<<<<<< HEAD
+=======
+        use_spot: bool = False,
+        max_hourly_cost: Optional[float] = None,
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
     ) -> Optional[str]:
         return catalog.get_default_instance_type(
             cpus=cpus,
@@ -129,6 +134,11 @@ class Mithril(clouds.Cloud):
             local_disk=local_disk,
             region=region,
             zone=zone,
+<<<<<<< HEAD
+=======
+            use_spot=use_spot,
+            max_hourly_cost=max_hourly_cost,
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
             clouds='mithril',
         )
 
@@ -202,6 +212,11 @@ class Mithril(clouds.Cloud):
                 local_disk=resources.local_disk,
                 region=resources.region,
                 zone=resources.zone,
+<<<<<<< HEAD
+=======
+                use_spot=resources.use_spot,
+                max_hourly_cost=resources.max_hourly_cost,
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
             )
             if default_instance_type is None:
                 return resources_utils.FeasibleResources([], [], None)
@@ -221,6 +236,10 @@ class Mithril(clouds.Cloud):
              local_disk=resources.local_disk,
              region=resources.region,
              zone=resources.zone,
+<<<<<<< HEAD
+=======
+             max_hourly_cost=resources.max_hourly_cost,
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
              clouds='mithril',
          ))
         if instance_list is None:
