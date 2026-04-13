@@ -10,7 +10,11 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
+<<<<<<< HEAD
 API_VERSION = 42  # api_access support for managed jobs
+=======
+API_VERSION = 48  # mount config read_only support
+>>>>>>> 50eb0d79c4411420c375405d90086f54676925a7
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -36,9 +40,18 @@ MIN_RECIPE_LAUNCH_API_VERSION = 33
 # Minimum API version that supports upload API v2.
 UPLOAD_API_V2_VERSION = 41
 
+<<<<<<< HEAD
 # Minimum server API version required for api_access in managed jobs.
 MIN_API_ACCESS_API_VERSION = 42
 
+=======
+# Minimum server API version required for api_server_access in managed jobs.
+MIN_API_ACCESS_API_VERSION = 42
+
+# Minimum API version that supports the SSH redirect first-frame protocol.
+MIN_SSH_REDIRECT_PROTOCOL_VERSION = 47
+
+>>>>>>> 50eb0d79c4411420c375405d90086f54676925a7
 # Prefix for API request names.
 REQUEST_NAME_PREFIX = 'sky.'
 # The memory (GB) that SkyPilot tries to not use to prevent OOM.
@@ -104,6 +117,12 @@ OAUTH2_PROXY_ENABLED_ENV_VAR = 'SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED'
 WEBSOCKETS_MAX_HEADER_LINE_LENGTH = '65536'
 WEBSOCKETS_MAX_NUM_HEADERS = '256'
 
+<<<<<<< HEAD
+=======
+# Request ID for the on-boot sky check request.
+ON_BOOT_CHECK_REQUEST_ID = 'skypilot-server-on-boot-check'
+
+>>>>>>> 50eb0d79c4411420c375405d90086f54676925a7
 # Request logs are stored in ~/.sky/api_server/request_logs/ to avoid NFS
 # performance issues in Kubernetes deployments where ~/sky_logs/ may be on
 # shared storage.
