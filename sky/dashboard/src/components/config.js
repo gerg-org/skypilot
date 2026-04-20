@@ -14,6 +14,10 @@ import {
 } from '@/components/elements/version-display';
 import { apiClient } from '@/data/connectors/client';
 import { checkGrafanaAvailability, getGrafanaUrl } from '@/utils/grafana';
+<<<<<<< HEAD
+=======
+import { trackSettingsAction } from '@/lib/analytics';
+>>>>>>> cfa6c120e434fde9bbbec2b904b23a0ac89b4c98
 import { PluginSlot } from '@/plugins/PluginSlot';
 
 export function Config() {
@@ -67,6 +71,7 @@ export function Config() {
   };
 
   const handleSave = async () => {
+    trackSettingsAction('save');
     setSaving(true);
     setError(null);
     // Clear any existing success timeout

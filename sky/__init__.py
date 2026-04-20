@@ -37,7 +37,7 @@ def _get_git_commit():
 
 
 __commit__ = _get_git_commit()
-__version__ = '0.12.0'
+__version__ = '1.0.0-dev0'
 __root_dir__ = directory_utils.get_sky_dir()
 
 
@@ -98,7 +98,9 @@ from sky.client.sdk import api_stop
 from sky.client.sdk import autostop
 from sky.client.sdk import cancel
 from sky.client.sdk import cost_report
+from sky.client.sdk import create_debug_dump
 from sky.client.sdk import down
+from sky.client.sdk import download_debug_dump
 from sky.client.sdk import download_logs
 from sky.client.sdk import endpoints
 from sky.client.sdk import exec  # pylint: disable=redefined-builtin
@@ -237,6 +239,9 @@ __all__ = [
     'api_start',
     'api_stop',
     'api_server_logs',
+    # Debug Dump
+    'create_debug_dump',
+    'download_debug_dump',
     # Admin Policy
     'UserRequest',
     'MutatedUserRequest',

@@ -88,6 +88,8 @@ class APIHealthResponse(ResponseBaseModel):
     latest_version: Optional[str] = None
     # Whether external proxy auth is enabled
     external_proxy_auth_enabled: bool = False
+    # Whether telemetry/usage collection is enabled
+    telemetry_enabled: bool = True
 
 
 class StatusResponse(ResponseBaseModel):
@@ -130,6 +132,11 @@ class StatusResponse(ResponseBaseModel):
     labels: Optional[Dict[str, str]] = None
     cluster_name_on_cloud: Optional[str] = None
     node_names: Optional[str] = None
+<<<<<<< HEAD
+=======
+    priority: Optional[int] = None
+    priority_class: Optional[str] = None
+>>>>>>> cfa6c120e434fde9bbbec2b904b23a0ac89b4c98
 
 
 class ClusterJobRecord(ResponseBaseModel):
@@ -203,6 +210,7 @@ class ManagedJobRecord(ResponseBaseModel):
     last_recovered_at: Optional[float] = None
     run_timestamp: Optional[str] = None
     priority: Optional[int] = None
+    priority_class: Optional[str] = None
     original_user_yaml_path: Optional[str] = None
     pool: Optional[str] = None
     pool_hash: Optional[str] = None
@@ -254,3 +262,5 @@ class VolumeRecord(ResponseBaseModel):
     # Error message for volume in ERROR state (e.g., PVC pending due to
     # access mode mismatch)
     error_message: Optional[str] = None
+    # YAML configuration used to create the volume
+    creation_yaml: Optional[str] = None

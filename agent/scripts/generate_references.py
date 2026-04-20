@@ -328,7 +328,11 @@ def _format_command(name: str, cmd, prefix: str = 'sky') -> str:
     if help_text:
         # Take first paragraph
         paragraphs = help_text.strip().split('\n\n')
+<<<<<<< HEAD
         first_para = paragraphs[0].replace('\n', ' ').strip()
+=======
+        first_para = ' '.join(paragraphs[0].split())
+>>>>>>> cfa6c120e434fde9bbbec2b904b23a0ac89b4c98
         lines.append(first_para)
         lines.append('')
 
