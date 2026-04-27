@@ -364,6 +364,10 @@ Tail or sync down the log of a managed job.
 - `--controller` — Show the controller logs of this job; useful for debugging launching/recoveries, etc.
 - `--refresh`, `-r` — Query the latest job logs, restarting the jobs controller if stopped.
 - `--sync-down`, `-s` — Download logs for all jobs shown in the queue.
+<<<<<<< HEAD
+=======
+- `--tail` (default: `0`) — The number of lines to display from the end of the log file. Default is 0, which means all lines. Useful for large logs (e.g. multi-GB) where downloading the full file is slow.
+>>>>>>> 565532c59288d5cfcd7dc58814aa93f7129f89ab
 - `JOB_ID` — integer
 - `TASK` — text
 
@@ -373,7 +377,11 @@ Tail or sync down the log of a managed job.
 
 ### `sky jobs pool apply`
 
+<<<<<<< HEAD
 Either apply a config to a pool for managed jobs submission     or update the number of workers in the pool. One of POOL_YAML or --workers     must be provided.
+=======
+Either apply a config to a pool for managed jobs submission or update the number of workers in the pool. One of POOL_YAML or --workers must be provided.
+>>>>>>> 565532c59288d5cfcd7dc58814aa93f7129f89ab
 
 **Options:**
 
@@ -737,10 +745,32 @@ Clean up a cluster set up with 'sky ssh up'.
 
 ### `sky ssh up`
 
+<<<<<<< HEAD
 Set up a cluster using SSH targets from a file. If not specified,     ~/.sky/ssh_node_pools.yaml will be used.
+=======
+Set up a cluster using SSH targets from a file. If not specified, ~/.sky/ssh_node_pools.yaml will be used.
+>>>>>>> 565532c59288d5cfcd7dc58814aa93f7129f89ab
 
 **Options:**
 
 - `--infra` — Name of the cluster to set up in ~/.sky/ssh_node_pools.yaml. If not specified, all clusters in the file will be set up.
 - `--async` — Run the command asynchronously.
 - `--file`, `-f` — The file containing the SSH targets.
+<<<<<<< HEAD
+=======
+
+## Other Commands
+
+### `sky debug-dump`
+
+Create a debug dump for troubleshooting. Creates a zip file containing logs, state, and configuration for the specified requests, clusters, and/or managed jobs. At least one of the filter options (--request-ids, --cluster-names, --job-ids, or --recent-minutes) must be provided.
+
+**Options:**
+
+- `--request-ids`, `-r` — Request IDs or prefixes to include in the dump.
+- `--cluster-names`, `-c` — Cluster names to include in the dump.
+- `--job-ids`, `-j` — Managed job IDs to include in the dump.
+- `--recent-minutes` — Include resources active within the last N minutes.
+- `--output` — Output path for the dump file.
+- `--async` — Run the command asynchronously.
+>>>>>>> 565532c59288d5cfcd7dc58814aa93f7129f89ab

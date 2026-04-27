@@ -139,6 +139,9 @@ TASK_ID_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}TASK_ID'
 # lifetime of the job.
 TASK_ID_LIST_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}TASK_IDS'
 
+# The integer managed job ID assigned by the jobs controller.
+MANAGED_JOB_ID_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}MANAGED_JOB_ID'
+
 # The version of skylet. MUST bump this version whenever we need the skylet to
 # be restarted on existing clusters updated with the new version of SkyPilot,
 # e.g., when we add new events to skylet, we fix a bug in skylet, or skylet
@@ -146,7 +149,11 @@ TASK_ID_LIST_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}TASK_IDS'
 # cluster yaml is updated.
 #
 # TODO(zongheng,zhanghao): make the upgrading of skylet automatic?
+<<<<<<< HEAD
 SKYLET_VERSION = '35'  # Add fields to ManagedJobInfo proto for handle.
+=======
+SKYLET_VERSION = '36'  # Add fields to ManagedJobInfo proto for handle.
+>>>>>>> 565532c59288d5cfcd7dc58814aa93f7129f89ab
 # The version of the lib files that skylet/jobs use. Whenever there is an API
 # change for the job_lib or log_lib, we need to bump this version, so that the
 # user can be notified to update their SkyPilot version on the remote cluster.
@@ -409,6 +416,11 @@ CLUSTER_NAME_VALID_REGEX = '[a-zA-Z]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?'
 RECIPE_NAME_VALID_REGEX = r'[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?'
 RECIPE_NAME_MAX_LENGTH = 40
 
+# Workspace names: lowercase letters, numbers, dashes, and underscores.
+# Must start with a lowercase letter, end with a lowercase letter or digit.
+WORKSPACE_NAME_VALID_REGEX = r'[a-z]([-_a-z0-9]*[a-z0-9])?'
+WORKSPACE_NAME_MAX_LENGTH = 63
+
 # Used for translate local file mounts to cloud storage. Please refer to
 # sky/execution.py::_maybe_translate_local_file_mounts_and_sync_up for
 # more details.
@@ -492,8 +504,16 @@ OVERRIDEABLE_CONFIG_KEYS_IN_TASK: List[Tuple[str, ...]] = [
     ('kubernetes', 'dws'),
     ('kubernetes', 'kueue'),
     ('kubernetes', 'remote_identity'),
+<<<<<<< HEAD
     ('azure', 'remote_identity'),
     ('azure', 'vpc_name'),
+=======
+    ('kubernetes', 'enable_docker'),
+    ('azure', 'remote_identity'),
+    ('azure', 'vpc_name'),
+    ('gcp', 'vpc_name'),
+    ('gcp', 'subnet_names'),
+>>>>>>> 565532c59288d5cfcd7dc58814aa93f7129f89ab
     ('gcp', 'managed_instance_group'),
     ('gcp', 'enable_gvnic'),
     ('gcp', 'enable_gpu_direct'),
@@ -501,6 +521,10 @@ OVERRIDEABLE_CONFIG_KEYS_IN_TASK: List[Tuple[str, ...]] = [
     ('vast', 'datacenter_only'),
     ('vast', 'create_instance_kwargs'),
     ('slurm', 'sbatch_options'),
+<<<<<<< HEAD
+=======
+    ('slurm', 'cpu_partition'),
+>>>>>>> 565532c59288d5cfcd7dc58814aa93f7129f89ab
     ('active_workspace',),
 ]
 # When overriding the SkyPilot configs on the API server with the client one,
