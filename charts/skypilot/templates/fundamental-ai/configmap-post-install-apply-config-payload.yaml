@@ -89,7 +89,8 @@ data:
           "do",
           "oci",
           "vast",
-          "lambda"
+          "lambda",
+          "nebius"
         ]
       },
       "env_vars": {
