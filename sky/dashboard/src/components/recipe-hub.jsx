@@ -58,6 +58,10 @@ import {
 } from '@/components/utils';
 import { showToast } from '@/data/connectors/toast';
 
+<<<<<<< HEAD
+=======
+import { trackRecipeAction, trackFilterUsed } from '@/lib/analytics';
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
 import {
   getRecipes,
   createRecipe,
@@ -119,7 +123,17 @@ function RecipeCard({ recipe, onPin }) {
 
   return (
     <div className="relative w-[300px]">
+<<<<<<< HEAD
       <Link href={`/recipes/${slug}`} className="block">
+=======
+      <Link
+        href={`/recipes/${slug}`}
+        className="block"
+        onClick={() =>
+          trackRecipeAction('view', { recipe_type: recipe.recipe_type })
+        }
+      >
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
         <Card className="h-full hover:bg-gray-50 transition-colors cursor-pointer group">
           <CardContent className="p-3">
             {/* Header with icon and name */}
@@ -315,7 +329,7 @@ function AllRecipesSection({ recipes, onPin, onDelete }) {
       {/* Filter Bar */}
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <span className="text-base text-gray-700">All Recipes</span>
-        <div className="w-full sm:w-auto">
+        <div className="w-full sm:w-auto max-w-xl">
           <RecipeFilterDropdown
             propertyList={RECIPE_PROPERTY_OPTIONS}
             valueList={optionValues}
@@ -675,6 +689,10 @@ const RecipeFilterDropdown = ({
   };
 
   const handleOptionSelect = (option) => {
+    trackFilterUsed('recipe', {
+      property: getPropertyLabel(propertyValue),
+      value: option,
+    });
     setFilters((prevFilters) => [
       ...prevFilters,
       {
@@ -690,6 +708,10 @@ const RecipeFilterDropdown = ({
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && value.trim() !== '') {
+      trackFilterUsed('recipe', {
+        property: getPropertyLabel(propertyValue),
+        value: value,
+      });
       setFilters((prevFilters) => [
         ...prevFilters,
         {
@@ -1197,6 +1219,7 @@ export function RecipeHub() {
 
   // Handlers
   const handleCreate = async (data) => {
+    trackRecipeAction('create', { type: data.recipeType });
     await createRecipe({
       ...data,
       // If ownerName is provided, pass it to override the user_name
@@ -1217,6 +1240,10 @@ export function RecipeHub() {
   };
 
   const handlePin = async (recipeName, pinned) => {
+<<<<<<< HEAD
+=======
+    trackRecipeAction('pin');
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
     try {
       const updated = await togglePinRecipe(recipeName, pinned);
       if (updated) {
@@ -1229,6 +1256,10 @@ export function RecipeHub() {
   };
 
   const handleDelete = async (recipeName) => {
+<<<<<<< HEAD
+=======
+    trackRecipeAction('delete');
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
     const deleted = await deleteRecipe(recipeName);
     if (deleted) {
       showToast('Recipe deleted successfully!', 'success');

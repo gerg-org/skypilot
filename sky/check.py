@@ -390,6 +390,15 @@ def check(
     clouds: Optional[Iterable[str]] = None,
     workspace: Optional[str] = None,
 ) -> Dict[str, Dict[str, List[str]]]:
+<<<<<<< HEAD
+=======
+    if workspace is not None:
+        # Import here to avoid circular import:
+        # pylint: disable=import-outside-toplevel
+        from sky.workspaces import core as workspaces_core
+        workspaces_core.check_workspace_permission(
+            common_utils.get_current_user(), workspace)
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
     capabilities_result = check_capabilities(quiet, verbose, clouds,
                                              sky_cloud.ALL_CAPABILITIES,
                                              workspace)
