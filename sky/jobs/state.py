@@ -130,6 +130,7 @@ job_info_table = sqlalchemy.Table(
     sqlalchemy.Column('priority',
                       sqlalchemy.Integer,
                       server_default=str(constants.DEFAULT_PRIORITY)),
+    sqlalchemy.Column('priority_class', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('entrypoint', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('original_user_yaml_path',
                       sqlalchemy.Text,
@@ -156,8 +157,23 @@ job_info_table = sqlalchemy.Table(
     sqlalchemy.Column('cloud', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('region', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('zone', sqlalchemy.Text, server_default=None),
+<<<<<<< HEAD
     # Node names for dashboard display (comma-separated)
     sqlalchemy.Column('node_names', sqlalchemy.Text, server_default=None),
+=======
+    # Whether this job is a batch coordinator (ds.map()).  Batch jobs are
+    # serialized one-at-a-time per pool by the scheduler.
+    sqlalchemy.Column('is_batch',
+                      sqlalchemy.Boolean,
+                      server_default=sqlalchemy.sql.expression.false()),
+    # Node names for dashboard display (comma-separated)
+    sqlalchemy.Column('node_names', sqlalchemy.Text, server_default=None),
+    # In consolidation mode, managed jobs shares the filemount blob managed
+    # by API server. This id is a reference to the blob.
+    sqlalchemy.Column('file_mounts_blob_id',
+                      sqlalchemy.Text,
+                      server_default=None),
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
 )
 
 # Separate table for API access token IDs associated with managed jobs.
@@ -195,6 +211,38 @@ job_events_table = sqlalchemy.Table(
                       sqlalchemy.DateTime(timezone=True),
                       index=True),
 )
+
+batch_state_table = sqlalchemy.Table(
+    'batch_state',
+    Base.metadata,
+    sqlalchemy.Column('job_id', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('batch_idx', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('start_idx', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('end_idx', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('status',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default='PENDING'),
+    sqlalchemy.Column('worker_cluster', sqlalchemy.Text),
+    sqlalchemy.Column('retry_count',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('updated_at', sqlalchemy.Float),
+    sqlalchemy.PrimaryKeyConstraint('job_id', 'batch_idx'),
+)
+
+# Subquery that aggregates batch_state into per-job progress counts.
+# Used by jobs-queue queries to supply batch_total_batches and
+# batch_completed_batches without denormalized columns on job_info.
+_batch_progress_subquery = sqlalchemy.select(
+    batch_state_table.c.job_id,
+    sqlalchemy.func.count().label(  # pylint: disable=not-callable
+        'batch_total_batches'),
+    sqlalchemy.func.count(  # pylint: disable=not-callable
+        sqlalchemy.case((batch_state_table.c.status
+                         == 'COMPLETED', 1),)).label('batch_completed_batches'),
+).group_by(batch_state_table.c.job_id).subquery('batch_progress')
 
 
 def create_table(engine: sqlalchemy.engine.Engine):
@@ -298,6 +346,7 @@ def _get_jobs_dict(r: 'row.RowMapping') -> Dict[str, Any]:
         'user_hash': r.get('user_hash'),
         'workspace': r.get('workspace'),
         'priority': r.get('priority'),
+        'priority_class': r.get('priority_class'),
         'entrypoint': r.get('entrypoint'),
         'original_user_yaml_path': r.get('original_user_yaml_path'),
         'original_user_yaml_content': r.get('original_user_yaml_content'),
@@ -314,6 +363,13 @@ def _get_jobs_dict(r: 'row.RowMapping') -> Dict[str, Any]:
         'cloud': r.get('cloud'),
         'region': r.get('region'),
         'zone': r.get('zone'),
+<<<<<<< HEAD
+=======
+        # Batch progress columns
+        'is_batch': r.get('is_batch'),
+        'batch_total_batches': r.get('batch_total_batches'),
+        'batch_completed_batches': r.get('batch_completed_batches'),
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
         'node_names': common_utils.get_display_node_names(r.get('node_names')),
     }
 
@@ -367,6 +423,9 @@ class ManagedJobStatus(enum.Enum):
     # The start_at timestamp of the managed job in the 'spot' table will be set
     # to the time when the job is firstly transitioned to RUNNING.
     RUNNING = 'RUNNING'
+    # WINDING_DOWN: All batches are done; the coordinator is waiting for
+    # worker threads to finish and merging per-batch output files.
+    WINDING_DOWN = 'WINDING_DOWN'
     # RECOVERING: The cluster is preempted, and the controller process is
     # recovering the cluster (relaunching/failover).
     RECOVERING = 'RECOVERING'
@@ -438,6 +497,7 @@ class ManagedJobStatus(enum.Enum):
             cls.PENDING,
             cls.STARTING,
             cls.RUNNING,
+            cls.WINDING_DOWN,
             cls.RECOVERING,
         ]
 
@@ -466,6 +526,8 @@ class ManagedJobStatus(enum.Enum):
                 cls.FAILED_PRECHECKS,
             managed_jobsv1_pb2.MANAGED_JOB_STATUS_FAILED_NO_RESOURCE:
                 cls.FAILED_NO_RESOURCE,
+            managed_jobsv1_pb2.MANAGED_JOB_STATUS_WINDING_DOWN:
+                cls.WINDING_DOWN,
         }
 
         if protobuf_value not in protobuf_to_enum:
@@ -503,6 +565,8 @@ class ManagedJobStatus(enum.Enum):
                 managed_jobsv1_pb2.MANAGED_JOB_STATUS_FAILED_PRECHECKS,
             ManagedJobStatus.FAILED_NO_RESOURCE:
                 managed_jobsv1_pb2.MANAGED_JOB_STATUS_FAILED_NO_RESOURCE,
+            ManagedJobStatus.WINDING_DOWN:
+                managed_jobsv1_pb2.MANAGED_JOB_STATUS_WINDING_DOWN,
         }
 
         if self not in enum_to_protobuf:
@@ -515,6 +579,7 @@ _SPOT_STATUS_TO_COLOR = {
     ManagedJobStatus.PENDING: colorama.Fore.BLUE,
     ManagedJobStatus.STARTING: colorama.Fore.BLUE,
     ManagedJobStatus.RUNNING: colorama.Fore.GREEN,
+    ManagedJobStatus.WINDING_DOWN: colorama.Fore.CYAN,
     ManagedJobStatus.RECOVERING: colorama.Fore.CYAN,
     ManagedJobStatus.SUCCEEDED: colorama.Fore.GREEN,
     ManagedJobStatus.FAILED: colorama.Fore.RED,
@@ -655,6 +720,7 @@ ControllerPidRecord = collections.namedtuple('ControllerPidRecord', [
 
 
 # === Status transition functions ===
+<<<<<<< HEAD
 def set_job_info_without_job_id(name: str,
                                 workspace: str,
                                 entrypoint: str,
@@ -662,6 +728,18 @@ def set_job_info_without_job_id(name: str,
                                 pool_hash: Optional[str],
                                 user_hash: Optional[str],
                                 execution: Optional[str] = None) -> int:
+=======
+def set_job_info_without_job_id(
+        name: str,
+        workspace: str,
+        entrypoint: str,
+        pool: Optional[str],
+        pool_hash: Optional[str],
+        user_hash: Optional[str],
+        execution: Optional[str] = None,
+        is_batch: bool = False,
+        file_mounts_blob_id: Optional[str] = None) -> int:
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
@@ -681,6 +759,8 @@ def set_job_info_without_job_id(name: str,
             pool_hash=pool_hash,
             user_hash=user_hash,
             execution=execution,
+            is_batch=is_batch,
+            file_mounts_blob_id=file_mounts_blob_id,
         )
 
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
@@ -1192,10 +1272,17 @@ def get_managed_job_tasks(job_id: int) -> List[Dict[str, Any]]:
     # Note: we will get the user_hash here, but don't try to call
     # global_user_state.get_user() on it. This runs on the controller, which may
     # not have the user info. Prefer to do it on the API server side.
-    query = sqlalchemy.select(spot_table, job_info_table).select_from(
+    query = sqlalchemy.select(
+        spot_table,
+        job_info_table,
+        _batch_progress_subquery.c.batch_total_batches,
+        _batch_progress_subquery.c.batch_completed_batches,
+    ).select_from(
         spot_table.outerjoin(
             job_info_table,
-            spot_table.c.spot_job_id == job_info_table.c.spot_job_id))
+            spot_table.c.spot_job_id == job_info_table.c.spot_job_id).outerjoin(
+                _batch_progress_subquery,
+                spot_table.c.spot_job_id == _batch_progress_subquery.c.job_id))
     query = query.where(spot_table.c.spot_job_id == job_id)
     query = query.order_by(spot_table.c.task_id.asc())
     rows = None
@@ -1241,6 +1328,10 @@ def _map_response_field_to_db_column(field: str):
         'job_id': spot_table.c.spot_job_id,  # public job id -> spot.spot_job_id
         '_job_info_job_id': job_info_table.c.spot_job_id,
         'job_name': job_info_table.c.name,  # public job name -> job_info.name
+        # Batch progress from batch_state aggregation subquery
+        'batch_total_batches': _batch_progress_subquery.c.batch_total_batches,
+        'batch_completed_batches':
+            _batch_progress_subquery.c.batch_completed_batches,
     }
     if field in alias_mapping:
         return alias_mapping[field]
@@ -1266,6 +1357,38 @@ def get_managed_jobs_total() -> int:
         return result[0] if result else 0
 
 
+<<<<<<< HEAD
+=======
+def get_active_file_mounts_blob_ids() -> Set[str]:
+    """Return blob ids referenced by jobs still in a non-terminal state.
+
+    Used by the API server's blob GC so that a blob is not reclaimed while
+    any managed job (including queued / recovering / winding-down jobs) still
+    needs its contents.
+    """
+    engine = _db_manager.get_engine()
+    terminal_status_values = [
+        s.value for s in ManagedJobStatus.terminal_statuses()
+    ]
+    non_terminal_job_ids_subquery = (sqlalchemy.select(
+        spot_table.c.spot_job_id).where(
+            sqlalchemy.or_(
+                spot_table.c.status.is_(None),
+                sqlalchemy.not_(
+                    spot_table.c.status.in_(terminal_status_values)),
+            )).distinct())
+    query = sqlalchemy.select(
+        job_info_table.c.file_mounts_blob_id.distinct()).where(
+            sqlalchemy.and_(
+                job_info_table.c.file_mounts_blob_id.is_not(None),
+                job_info_table.c.spot_job_id.in_(non_terminal_job_ids_subquery),
+            ))
+    with orm.Session(engine) as session:
+        rows = session.execute(query).fetchall()
+    return {row[0] for row in rows if row[0] is not None}
+
+
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
 def get_managed_jobs_highest_priority() -> int:
     """Get the highest priority of the managed jobs."""
     engine = _db_manager.get_engine()
@@ -1319,11 +1442,18 @@ def build_managed_jobs_with_filters_no_status_query(
         query = sqlalchemy.select(spot_table.c.status,
                                   sqlalchemy.func.count().label('count'))  # pylint: disable=not-callable
     else:
-        query = sqlalchemy.select(spot_table, job_info_table)
+        query = sqlalchemy.select(
+            spot_table,
+            job_info_table,
+            _batch_progress_subquery.c.batch_total_batches,
+            _batch_progress_subquery.c.batch_completed_batches,
+        )
     query = query.select_from(
         spot_table.outerjoin(
             job_info_table,
-            spot_table.c.spot_job_id == job_info_table.c.spot_job_id))
+            spot_table.c.spot_job_id == job_info_table.c.spot_job_id).outerjoin(
+                _batch_progress_subquery,
+                spot_table.c.spot_job_id == _batch_progress_subquery.c.job_id))
     if skip_finished:
         # Filter out finished jobs at the DB level. If a multi-task job is
         # partially finished, include all its tasks. We do this by first
@@ -1676,6 +1806,7 @@ def get_task_specs(job_id: int, task_id: int) -> Dict[str, Any]:
         return json.loads(task_specs[0])
 
 
+<<<<<<< HEAD
 def scheduler_set_waiting(job_ids: List[int], dag_yaml_content: str,
                           original_user_yaml_content: str,
                           env_file_content: str,
@@ -1683,18 +1814,32 @@ def scheduler_set_waiting(job_ids: List[int], dag_yaml_content: str,
                           priority: int) -> None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+=======
+def scheduler_set_waiting(job_ids: List[int],
+                          dag_yaml_content: str,
+                          original_user_yaml_content: str,
+                          env_file_content: str,
+                          config_file_content: Optional[str],
+                          priority: int,
+                          priority_class: Optional[str] = None) -> None:
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        updates = {
+            job_info_table.c.schedule_state:
+                ManagedJobScheduleState.WAITING.value,
+            job_info_table.c.dag_yaml_content: dag_yaml_content,
+            job_info_table.c.original_user_yaml_content:
+                (original_user_yaml_content),
+            job_info_table.c.env_file_content: env_file_content,
+            job_info_table.c.config_file_content: config_file_content,
+            job_info_table.c.priority: priority,
+        }
+        if priority_class is not None:
+            updates[job_info_table.c.priority_class] = priority_class
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
         updated_count = session.query(job_info_table).filter(
-            sqlalchemy.and_(job_info_table.c.spot_job_id.in_(job_ids),)).update(
-                {
-                    job_info_table.c.schedule_state:
-                        ManagedJobScheduleState.WAITING.value,
-                    job_info_table.c.dag_yaml_content: dag_yaml_content,
-                    job_info_table.c.original_user_yaml_content:
-                        (original_user_yaml_content),
-                    job_info_table.c.env_file_content: env_file_content,
-                    job_info_table.c.config_file_content: config_file_content,
-                    job_info_table.c.priority: priority,
-                })
+            sqlalchemy.and_(
+                job_info_table.c.spot_job_id.in_(job_ids),)).update(updates)
         session.commit()
         assert updated_count == len(job_ids), (job_ids, updated_count)
 
@@ -1791,6 +1936,105 @@ def set_job_infra(job_id: int,
             session.commit()
 
 
+<<<<<<< HEAD
+=======
+def save_batch_states(job_id: int, batches: List[List[int]]) -> None:
+    """Bulk insert all batch records (atomic).
+
+    Args:
+        job_id: Managed job ID.
+        batches: List of [start_idx, end_idx] pairs, indexed by batch_idx.
+    """
+    engine = _db_manager.get_engine()
+    now = time.time()
+    rows = [{
+        'job_id': job_id,
+        'batch_idx': idx,
+        'start_idx': b[0],
+        'end_idx': b[1],
+        'status': 'PENDING',
+        'retry_count': 0,
+        'updated_at': now,
+    } for idx, b in enumerate(batches)]
+    with orm.Session(engine) as session:
+        session.execute(batch_state_table.insert(), rows)
+        session.commit()
+
+
+def is_batch_job(job_id: int) -> bool:
+    """Check if a job is a batch coordinator job."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(job_info_table.c.is_batch).where(
+                job_info_table.c.spot_job_id == job_id))
+        row = result.one_or_none()
+        return row is not None and bool(row[0])
+
+
+def get_batch_states(job_id: int) -> List[Dict[str, Any]]:
+    """Read all batch records ordered by batch_idx.
+
+    Returns:
+        List of dicts with keys: batch_idx, start_idx, end_idx, status,
+        worker_cluster, retry_count, updated_at.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(batch_state_table).where(
+                batch_state_table.c.job_id == job_id).order_by(
+                    batch_state_table.c.batch_idx))
+        rows = result.mappings().all()
+        return [dict(r) for r in rows]
+
+
+def set_batch_status(job_id: int,
+                     batch_idx: int,
+                     status: str,
+                     worker_cluster: Optional[str] = None,
+                     retry_count: Optional[int] = None) -> None:
+    """Update a single batch record's status.
+
+    Args:
+        job_id: Managed job ID.
+        batch_idx: 0-based batch index.
+        status: New status (PENDING, DISPATCHED, COMPLETED, FAILED).
+        worker_cluster: Cluster processing this batch (optional).
+        retry_count: Current retry count (optional).
+    """
+    engine = _db_manager.get_engine()
+    values: Dict[str, Any] = {
+        'status': status,
+        'updated_at': time.time(),
+    }
+    if worker_cluster is not None:
+        values['worker_cluster'] = worker_cluster
+    if retry_count is not None:
+        values['retry_count'] = retry_count
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(batch_state_table).where(
+                sqlalchemy.and_(
+                    batch_state_table.c.job_id == job_id,
+                    batch_state_table.c.batch_idx == batch_idx)).values(values))
+        session.commit()
+
+
+def reset_dispatched_batches(job_id: int) -> None:
+    """Reset all DISPATCHED batches to PENDING for crash recovery."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(batch_state_table).where(
+                sqlalchemy.and_(
+                    batch_state_table.c.job_id == job_id,
+                    batch_state_table.c.status == 'DISPATCHED')).values(
+                        status='PENDING', updated_at=time.time()))
+        session.commit()
+
+
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
 def update_job_full_resources(job_id: int,
                               full_resources_json: Dict[str, Any]) -> None:
     """Update the full_resources column for a job.
@@ -1858,10 +2102,29 @@ async def get_pool_submit_info_async(
 def set_api_access_token_id(job_id: int, token_id: str) -> None:
     """Store the API access token ID for a managed job."""
     engine = _db_manager.get_engine()
+<<<<<<< HEAD
     with orm.Session(engine) as session:
         session.execute(
             sqlalchemy.insert(api_access_token_table).values(job_id=job_id,
                                                              token_id=token_id))
+=======
+    dialect_map = {
+        db_utils.SQLAlchemyDialect.SQLITE.value: sqlite.insert,
+        db_utils.SQLAlchemyDialect.POSTGRESQL.value: postgresql.insert,
+    }
+    insert_func = dialect_map.get(engine.dialect.name)
+    if insert_func is None:
+        raise ValueError(f'Unsupported database dialect: {engine.dialect.name}')
+    with orm.Session(engine) as session:
+        insert_stmt = insert_func(api_access_token_table).values(
+            job_id=job_id, token_id=token_id)
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[api_access_token_table.c.job_id],
+            set_={
+                api_access_token_table.c.token_id: insert_stmt.excluded.token_id
+            })
+        session.execute(upsert_stmt)
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
         session.commit()
 
 
@@ -2119,15 +2382,47 @@ async def get_waiting_job_async(
     """
     engine = await _db_manager.get_async_engine()
     async with sql_async.AsyncSession(engine) as session:
+<<<<<<< HEAD
         # Select the highest priority waiting job for update (locks the row)
+=======
+        # Subquery: pools that already have an active *batch* job.
+        # Batch coordinator jobs (ds.map()) are serialized one-at-a-time
+        # per pool, so we skip WAITING batch jobs whose pool already has
+        # another active batch job.  Regular (non-batch) pool jobs are
+        # unaffected — they can run concurrently on the same pool.
+        active_batch_states = [
+            ManagedJobScheduleState.LAUNCHING.value,
+            ManagedJobScheduleState.ALIVE.value,
+            ManagedJobScheduleState.ALIVE_WAITING.value,
+            ManagedJobScheduleState.ALIVE_BACKOFF.value,
+        ]
+        busy_batch_pools_subq = sqlalchemy.select(job_info_table.c.pool,).where(
+            sqlalchemy.and_(
+                job_info_table.c.pool.isnot(None),
+                job_info_table.c.is_batch.is_(True),
+                job_info_table.c.schedule_state.in_(active_batch_states),
+            )).correlate(None).scalar_subquery()
+
+        # Select the highest priority waiting job for update (locks the row).
+        # Batch jobs are skipped when their pool already has an active batch
+        # job; non-batch jobs (including regular pool jobs) are always eligible.
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
         select_query = sqlalchemy.select(
             job_info_table.c.spot_job_id,
             job_info_table.c.schedule_state,
             job_info_table.c.pool,
         ).where(
-            job_info_table.c.schedule_state.in_([
-                ManagedJobScheduleState.WAITING.value,
-            ])).order_by(
+            sqlalchemy.and_(
+                job_info_table.c.schedule_state.in_([
+                    ManagedJobScheduleState.WAITING.value,
+                ]),
+                sqlalchemy.or_(
+                    # Non-batch jobs: always eligible.
+                    job_info_table.c.is_batch.isnot(True),
+                    # Batch jobs: only if pool has no active batch job.
+                    ~job_info_table.c.pool.in_(busy_batch_pools_subq),
+                ),
+            )).order_by(
                 job_info_table.c.priority.desc(),
                 job_info_table.c.spot_job_id.asc(),
             ).limit(1).with_for_update()
@@ -2183,6 +2478,21 @@ def get_workspace(job_id: int) -> str:
         return job_workspace
 
 
+<<<<<<< HEAD
+=======
+def get_file_mounts_blob_id(job_id: int) -> Optional[str]:
+    """Return the file_mounts_blob_id persisted for a job, if any."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(job_info_table.c.file_mounts_blob_id).where(
+                job_info_table.c.spot_job_id == job_id)).fetchone()
+        if row is None:
+            return None
+        return row[0]
+
+
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
 async def get_latest_task_id_status_async(
         job_id: int) -> Tuple[Optional[int], Optional[ManagedJobStatus]]:
     """Returns the (task id, status) of the latest task of a job."""
@@ -2284,6 +2594,21 @@ async def set_started_async(job_id: int, task_id: int, start_time: float,
     await callback_func('STARTED')
 
 
+<<<<<<< HEAD
+=======
+def get_job_status_with_task_id(job_id: int,
+                                task_id: int) -> Optional[ManagedJobStatus]:
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(spot_table.c.status).where(
+                sqlalchemy.and_(spot_table.c.spot_job_id == job_id,
+                                spot_table.c.task_id == task_id)))
+        status = result.fetchone()
+        return ManagedJobStatus(status[0]) if status else None
+
+
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
 async def get_job_status_with_task_id_async(
         job_id: int, task_id: int) -> Optional[ManagedJobStatus]:
     engine = await _db_manager.get_async_engine()
@@ -2305,6 +2630,7 @@ async def set_recovering_async(
     cluster_event_reason: Optional[str] = None,
 ):
     """Set the task to recovering state, and update the job duration."""
+<<<<<<< HEAD
     # Build code and reason from external failures for the event log
     code = None
     reason_parts = []
@@ -2316,6 +2642,18 @@ async def set_recovering_async(
         reason_parts.append(external_failure_reason)
     if reason_parts:
         reason = ': '.join(reason_parts)
+=======
+    # Build code and reason from external failures for the event log.
+    # Prefer external_failures over cluster_event_reason to avoid
+    # duplicating the same message when a plugin writes the same reason
+    # to both cluster events and cluster failures.
+    code = None
+    if external_failures:
+        code = '; '.join(f.code for f in external_failures)
+        reason = '; '.join(f.reason for f in external_failures)
+    elif cluster_event_reason:
+        reason = cluster_event_reason
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
     else:
         assert code is None, 'Code should be None if there are no reasons.'
         reason = 'Cluster preempted or failed, recovering'
@@ -2399,6 +2737,41 @@ async def set_recovered_async(job_id: int, task_id: int, recovered_time: float,
     await callback_func('RECOVERED')
 
 
+<<<<<<< HEAD
+async def set_succeeded_async(job_id: int, task_id: int, end_time: float,
+                              callback_func: AsyncCallbackType):
+    """Set the task to succeeded, if it is in a non-terminal state."""
+    await add_job_event_async(job_id, task_id, ManagedJobStatus.SUCCEEDED,
+                              'Job has succeeded')
+    engine = await _db_manager.get_async_engine()
+    async with sql_async.AsyncSession(engine) as session:
+        result = await session.execute(
+=======
+def set_winding_down(job_id: int, task_id: int) -> None:
+    """Transition task from RUNNING to WINDING_DOWN (sync).
+
+    Called by the batch coordinator (which runs in a thread) before
+    merging per-batch output files.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
+            sqlalchemy.update(spot_table).where(
+                sqlalchemy.and_(
+                    spot_table.c.spot_job_id == job_id,
+                    spot_table.c.task_id == task_id,
+                    spot_table.c.status == ManagedJobStatus.RUNNING.value,
+                    spot_table.c.end_at.is_(None),
+                )).values(
+                    {spot_table.c.status: ManagedJobStatus.WINDING_DOWN.value}))
+        session.commit()
+        if result.rowcount != 1:
+            logger.warning(f'set_winding_down: expected 1 row updated, '
+                           f'got {result.rowcount} for job_id={job_id}, '
+                           f'task_id={task_id}')
+
+
 async def set_succeeded_async(job_id: int, task_id: int, end_time: float,
                               callback_func: AsyncCallbackType):
     """Set the task to succeeded, if it is in a non-terminal state."""
@@ -2411,7 +2784,10 @@ async def set_succeeded_async(job_id: int, task_id: int, end_time: float,
                 sqlalchemy.and_(
                     spot_table.c.spot_job_id == job_id,
                     spot_table.c.task_id == task_id,
-                    spot_table.c.status == ManagedJobStatus.RUNNING.value,
+                    spot_table.c.status.in_([
+                        ManagedJobStatus.RUNNING.value,
+                        ManagedJobStatus.WINDING_DOWN.value,
+                    ]),
                     spot_table.c.end_at.is_(None),
                 )).values({
                     spot_table.c.status: ManagedJobStatus.SUCCEEDED.value,
@@ -2645,7 +3021,12 @@ def set_job_info(job_id: int,
                  pool: Optional[str],
                  pool_hash: Optional[str],
                  user_hash: Optional[str] = None,
+<<<<<<< HEAD
                  execution: Optional[str] = None):
+=======
+                 execution: Optional[str] = None,
+                 is_batch: bool = False):
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
@@ -2665,6 +3046,7 @@ def set_job_info(job_id: int,
             pool_hash=pool_hash,
             user_hash=user_hash,
             execution=execution,
+            is_batch=is_batch,
         )
         session.execute(insert_stmt)
         session.commit()

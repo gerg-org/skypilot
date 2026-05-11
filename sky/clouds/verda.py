@@ -181,6 +181,11 @@ class Verda(clouds.Cloud):
         local_disk: Optional[str] = None,
         region: Optional[str] = None,
         zone: Optional[str] = None,
+<<<<<<< HEAD
+=======
+        use_spot: bool = False,
+        max_hourly_cost: Optional[float] = None,
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
     ) -> Optional[str]:
         """Returns the default instance type for Verda."""
         return catalog.get_default_instance_type(
@@ -190,6 +195,11 @@ class Verda(clouds.Cloud):
             local_disk=local_disk,
             region=region,
             zone=zone,
+<<<<<<< HEAD
+=======
+            use_spot=use_spot,
+            max_hourly_cost=max_hourly_cost,
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
             clouds='verda',
         )
 
@@ -295,6 +305,11 @@ class Verda(clouds.Cloud):
                 disk_tier=resources.disk_tier,
                 region=resources.region,
                 zone=resources.zone,
+<<<<<<< HEAD
+=======
+                use_spot=resources.use_spot,
+                max_hourly_cost=resources.max_hourly_cost,
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
             )
             if default_instance_type is None:
                 # TODO: Add hints to all return values in this method to help
@@ -314,6 +329,10 @@ class Verda(clouds.Cloud):
              cpus=resources.cpus,
              region=resources.region,
              zone=resources.zone,
+<<<<<<< HEAD
+=======
+             max_hourly_cost=resources.max_hourly_cost,
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
              clouds='verda',
          ))
         if instance_list is None:

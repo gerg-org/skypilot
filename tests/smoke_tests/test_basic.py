@@ -505,6 +505,161 @@ def test_autostop_with_docker_image(generic_cloud: str):
 @pytest.mark.no_hyperbolic
 @pytest.mark.no_shadeform
 @pytest.mark.no_seeweb
+def test_autostop_ssh_alive_after_stop_start(generic_cloud: str):
+    """Active SSH must prevent autostop after `sky stop` + `sky start`.
+
+    Regression test for https://github.com/skypilot-org/skypilot/issues/9524.
+    psutil's get_terminal_map() is module-globally memoized; if skylet's
+    first AutostopEvent tick after `sky start` runs with no SSH attached,
+    the cache freezes empty and any later SSH session is invisible. The
+    cluster then autostops despite an active interactive session even
+    when wait_for=jobs_and_ssh.
+    """
+    name = smoke_tests_utils.get_cluster_name()
+    autostop_timeout = 600 if generic_cloud == 'azure' else 250
+    test = smoke_tests_utils.Test(
+        'test_autostop_ssh_alive_after_stop_start',
+        [
+            f's=$(SKYPILOT_DEBUG=0 sky launch -y -c {name} --infra {generic_cloud} '
+            f'{smoke_tests_utils.LOW_RESOURCE_ARG} '
+            f'tests/test_yamls/minimal.yaml) && '
+            f'{smoke_tests_utils.VALIDATE_LAUNCH_OUTPUT}',
+            f'sky logs {name} 1 --status',
+            f'sky status -r {name} | grep UP',
+
+            # The #9524 trigger: stop, then start. Crucially, do not SSH
+            # during `sky start` so /dev/pts/ is empty when skylet's first
+            # AutostopEvent tick fires (~60s after boot) and primes the
+            # buggy cache.
+            f'sky stop -y {name}',
+            smoke_tests_utils.get_cmd_wait_until_cluster_status_contains(
+                cluster_name=name,
+                cluster_status=[sky.ClusterStatus.STOPPED],
+                timeout=autostop_timeout),
+            f'sky start -y {name}',
+            smoke_tests_utils.get_cmd_wait_until_cluster_status_contains(
+                cluster_name=name,
+                cluster_status=[sky.ClusterStatus.UP],
+                timeout=smoke_tests_utils.get_timeout(generic_cloud)),
+
+            # Arm autostop FIRST so AutostopEvent ticks actually call
+            # has_active_ssh_sessions() (otherwise they early-exit on
+            # boot_time mismatch and never touch psutil's terminal-map
+            # cache). idle_minutes=3 leaves a buffer past the assertion
+            # at T+270s so the post-SSH race cannot trigger a legit
+            # autostop before we kill SSH.
+            f'sky autostop -y {name} -i 3',
+            f'sky status | grep {name} | grep "3m"',
+
+            # Now wait 90s with NO SSH so skylet's first 1-2
+            # AutostopEvent ticks call has_active_ssh_sessions() while
+            # /dev/pts/ is empty, priming the buggy psutil cache as empty.
+            'sleep 90',
+
+            # Background a `-tt` SSH that holds a remote PTY past the
+            # idle window. With the bug, every later tick still sees no
+            # PTY (stale cache) -> at ~T_arm+180s idle hits 3 min and
+            # the cluster autostops despite the active SSH. Assertion
+            # at T_arm+90+180=T_arm+270s catches the STOPPED state.
+            # With the fix, every tick re-globs /dev/pts/, sees the SSH
+            # PTY, resets last_active, and the cluster stays UP.
+            f'ssh -tt {name} "sleep 300" </dev/null '
+            f'>/tmp/sky-9524-ssh.out 2>&1 & '
+            f'SSH_PID=$!; sleep 180; '
+            f's=$(sky status -r {name}); echo "$s"; '
+            f'echo "$s" | grep {name} | grep UP; rc=$?; '
+            f'kill $SSH_PID 2>/dev/null; '
+            f'wait $SSH_PID 2>/dev/null; exit $rc',
+
+            # SSH closed; cluster eventually autostops normally.
+            smoke_tests_utils.get_cmd_wait_until_cluster_status_contains(
+                cluster_name=name,
+                cluster_status=[sky.ClusterStatus.STOPPED],
+                timeout=autostop_timeout),
+        ],
+        f'sky down -y {name}',
+        timeout=smoke_tests_utils.get_timeout(generic_cloud) +
+        2 * autostop_timeout,
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
+# See cloud exclusion explanations in test_autostop
+@pytest.mark.no_fluidstack
+@pytest.mark.no_lambda_cloud
+@pytest.mark.no_ibm
+@pytest.mark.no_kubernetes
+@pytest.mark.no_slurm
+@pytest.mark.no_hyperbolic
+@pytest.mark.no_shadeform
+@pytest.mark.no_seeweb
+def test_autostop_ssh_alive_after_stop_start_with_docker_image(
+        generic_cloud: str):
+    """#9524 regression test on a Docker-image cluster.
+
+    Same scenario as test_autostop_ssh_alive_after_stop_start, but the
+    cluster runs `image_id: docker:ubuntu:22.04`. The container's
+    entrypoint holds a PTY (see test_autostop_with_docker_image), which
+    must NOT be misclassified as an active SSH session, while a real
+    SSH session opened after `sky stop` + `sky start` MUST be detected.
+    """
+    name = smoke_tests_utils.get_cluster_name()
+    autostop_timeout = 600 if generic_cloud == 'azure' else 250
+    test = smoke_tests_utils.Test(
+        'test_autostop_ssh_alive_after_stop_start_with_docker_image',
+        [
+            f's=$(SKYPILOT_DEBUG=0 sky launch -y -c {name} --infra {generic_cloud} '
+            f'{smoke_tests_utils.LOW_RESOURCE_ARG} '
+            f'--image-id docker:ubuntu:22.04 '
+            f'tests/test_yamls/minimal.yaml) && '
+            f'{smoke_tests_utils.VALIDATE_LAUNCH_OUTPUT}',
+            f'sky logs {name} 1 --status',
+            f'sky status -r {name} | grep UP',
+            f'sky stop -y {name}',
+            smoke_tests_utils.get_cmd_wait_until_cluster_status_contains(
+                cluster_name=name,
+                cluster_status=[sky.ClusterStatus.STOPPED],
+                timeout=autostop_timeout),
+            f'sky start -y {name}',
+            smoke_tests_utils.get_cmd_wait_until_cluster_status_contains(
+                cluster_name=name,
+                cluster_status=[sky.ClusterStatus.UP],
+                timeout=smoke_tests_utils.get_timeout(generic_cloud)),
+            # See test_autostop_ssh_alive_after_stop_start for the
+            # rationale of this ordering: arm autostop FIRST, then
+            # sleep 90s with no SSH so the buggy psutil cache locks
+            # empty before SSH starts.
+            f'sky autostop -y {name} -i 3',
+            f'sky status | grep {name} | grep "3m"',
+            'sleep 90',
+            f'ssh -tt {name} "sleep 300" </dev/null '
+            f'>/tmp/sky-9524-ssh.out 2>&1 & '
+            f'SSH_PID=$!; sleep 180; '
+            f's=$(sky status -r {name}); echo "$s"; '
+            f'echo "$s" | grep {name} | grep UP; rc=$?; '
+            f'kill $SSH_PID 2>/dev/null; '
+            f'wait $SSH_PID 2>/dev/null; exit $rc',
+            smoke_tests_utils.get_cmd_wait_until_cluster_status_contains(
+                cluster_name=name,
+                cluster_status=[sky.ClusterStatus.STOPPED],
+                timeout=autostop_timeout),
+        ],
+        f'sky down -y {name}',
+        timeout=smoke_tests_utils.get_timeout(generic_cloud) +
+        2 * autostop_timeout,
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
+# See cloud exclusion explanations in test_autostop
+@pytest.mark.no_fluidstack
+@pytest.mark.no_lambda_cloud
+@pytest.mark.no_ibm
+@pytest.mark.no_kubernetes
+@pytest.mark.no_slurm
+@pytest.mark.no_hyperbolic
+@pytest.mark.no_shadeform
+@pytest.mark.no_seeweb
 def test_launch_waits_for_autostopping(generic_cloud: str):
     """Test that launch waits for autostopping to complete.
 
@@ -1007,6 +1162,137 @@ def test_cli_logs(generic_cloud: str):
     smoke_tests_utils.run_one_test(test)
 
 
+# ---------- CLI logs: streaming edge cases ----------
+# Exercises `sky logs <cluster> <job>` (i.e. streaming mode, not
+# `--status`) against two patterns that show up routinely in ML training
+# output but that prior smoke tests never covered:
+#
+#   1. A single log line far larger than any reasonable fixed-size scanner
+#      buffer. JSON configs, dataset summaries, tensor dumps, tokenizer
+#      vocabularies, and image-mode progress snapshots all easily clear
+#      256 KB on one line.
+#
+#   2. `\r`-only progress-bar updates (tqdm / keras / rich.progress). The
+#      server emits a single log "line" (server-side split is on `\n`),
+#      but the client has to recognise `\r` as an in-place terminator or
+#      the progress frames look hung until the bar is replaced by a
+#      `\n`-terminated summary line.
+#
+# Clients implementing the streaming read with a fixed-size line buffer
+# (e.g. Go's ``bufio.Scanner``, default 64 KB, or a hand-bounded 256 KB)
+# will silently truncate or fail on case (1); clients that split only
+# on `\n` will visually hang on case (2). Python's reference SDK uses
+# ``iter_content`` + ``str.splitlines`` which has neither limitation, so
+# historically this gap never surfaced in the OSS smoke tests.
+@pytest.mark.no_hyperbolic
+def test_cli_logs_streaming_long_line(generic_cloud: str):
+    name = smoke_tests_utils.get_cluster_name()
+    # wc -L prints the length of the single longest line in the stream.
+    # test -ge 300000 confirms the full 300 KB line survived streaming end
+    # to end; grep on the bracket markers confirms the lines around it
+    # weren't dropped in the process.
+    test = smoke_tests_utils.Test(
+        'cli_logs_streaming_long_line',
+        [
+            f'sky launch -y -c {name} --infra {generic_cloud} '
+            f'{smoke_tests_utils.LOW_RESOURCE_ARG} '
+            f'tests/test_yamls/long_log_line.yaml',
+            f'sky logs {name} 1 --status',
+            f'out=$(sky logs {name} 1) && '
+            f'echo "$out" | grep -q "LONG_LOG_LINE_START" && '
+            f'echo "$out" | grep -q "LONG_LOG_LINE_END" && '
+            f'longest=$(echo "$out" | awk \'{{ print length($0) }}\' '
+            f'| sort -rn | head -1) && '
+            f'test "$longest" -ge 300000',
+        ],
+        f'sky down -y {name}',
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
+@pytest.mark.no_hyperbolic
+def test_cli_logs_streaming_progress_bar(generic_cloud: str):
+    name = smoke_tests_utils.get_cluster_name()
+    test = smoke_tests_utils.Test(
+        'cli_logs_streaming_progress_bar',
+        [
+            f'sky launch -y -c {name} --infra {generic_cloud} '
+            f'{smoke_tests_utils.LOW_RESOURCE_ARG} '
+            f'tests/test_yamls/cr_progress_bar.yaml',
+            f'sky logs {name} 1 --status',
+            # Every frame must reach the client (the server writes them
+            # all into the log file; the client has to render them).
+            f'out=$(sky logs {name} 1) && '
+            f'for i in 0 1 2 3 4; do '
+            f'echo "$out" | grep -q "progress-frame-$i" || exit 1; '
+            f'done && '
+            # And the final \n-terminated summary line comes through.
+            f'echo "$out" | grep -q "PROGRESS_BAR_DONE"',
+        ],
+        f'sky down -y {name}',
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
+@pytest.mark.no_hyperbolic
+def test_cli_logs_streaming_realtime(generic_cloud: str):
+    """Confirm `sky logs` is actually streaming, not buffering until exit.
+
+    Submits a job that prints six STREAM_TICK_* lines five seconds apart
+    (`python3 -u` to defeat OS-level pipe buffering), then immediately
+    starts `sky logs` against it and timestamps each line as it arrives
+    at the client (`while read line` instead of `awk` because `awk`
+    block-buffers its stdin and would mask the very property we are
+    testing). The receive timestamps of the first and last STREAM_TICK
+    lines must be at least 15 seconds apart — anything smaller means
+    the entire job's output landed in one burst at the end, i.e. some
+    component along the path (job runner, server, or client) is buffering.
+
+    Why this matters: the existing log smoke tests all run
+    `sky logs --status` or capture output with `$(sky logs ...)` after
+    the job has already finished, so they can't tell the difference
+    between a real streaming pipeline and one that simply hands the
+    full log file over once the job exits. A regression that breaks
+    incremental streaming (e.g. a too-large server-side flush buffer)
+    would look identical to the user when running `sky logs <cluster>
+    <job>` mid-run — no errors, just dead air for the entire job
+    runtime.
+    """
+    name = smoke_tests_utils.get_cluster_name()
+    test = smoke_tests_utils.Test(
+        'cli_logs_streaming_realtime',
+        [
+            # Provision the cluster with a no-op so the streaming job
+            # below doesn't pay provisioning latency on the timing-sensitive
+            # path.
+            f'sky launch -y -c {name} --infra {generic_cloud} '
+            f'{smoke_tests_utils.LOW_RESOURCE_ARG} -- "true"',
+            # Submit the streaming job detached and capture its job id from
+            # the submit output, then start `sky logs` immediately so we
+            # are reading while the job is still running.
+            f'submit_out=$(sky exec -d {name} '
+            f'tests/test_yamls/streaming_logs.yaml 2>&1) && '
+            f'echo "$submit_out" && '
+            f'job_id=$(echo "$submit_out" | grep -oE '
+            f'"Job submitted, ID: [0-9]+" | awk \'{{print $4}}\') && '
+            f'sky logs {name} "$job_id" 2>&1 | '
+            f'while IFS= read -r line; do '
+            f'printf "%d %s\\n" "$(date +%s)" "$line"; '
+            f'done > /tmp/sky-logs-streaming-timing.log && '
+            f'cat /tmp/sky-logs-streaming-timing.log && '
+            f'ticks=$(grep STREAM_TICK '
+            f'/tmp/sky-logs-streaming-timing.log | awk \'{{print $1}}\') && '
+            f'first=$(echo "$ticks" | head -1) && '
+            f'last=$(echo "$ticks" | tail -1) && '
+            f'spread=$((last - first)) && '
+            f'echo "tick spread = $spread s" && '
+            f'test "$spread" -ge 15',
+        ],
+        f'sky down -y {name}',
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
 @pytest.mark.scp
 def test_scp_logs():
     name = smoke_tests_utils.get_cluster_name()
@@ -1198,11 +1484,11 @@ def test_jobs_launch_and_logs(generic_cloud: str):
             queue_response = (
                 smoke_tests_utils.get_response_from_request_id_dashboard(
                     queue_request_id))
-            job_exist = False
-            for job in queue_response:
-                if job['job_id'] == job_id:
-                    job_exist = True
-                    break
+            # queue_v2 decoder returns (jobs, total, status_counts,
+            # total_no_filter); legacy queue returned a plain list.
+            jobs = queue_response[0] if isinstance(queue_response,
+                                                   tuple) else queue_response
+            job_exist = any(job.job_id == job_id for job in jobs)
             assert job_exist
             try:
                 with tempfile.TemporaryFile(mode='w+', encoding='utf-8') as f:
@@ -1571,6 +1857,76 @@ def test_kubernetes_get_nodes():
             'address': addr.address
         } for addr in preloaded_node.status.addresses]
         assert node_addresses == preloaded_addresses
+
+
+@pytest.mark.kubernetes
+@pytest.mark.resource_heavy
+@pytest.mark.no_dependency
+def test_kubernetes_allowed_nodes():
+    """Test that allowed_nodes config filters discovery and scheduling.
+
+    This test requires a multi-node Kubernetes cluster (runs on EKS/GKE
+    resource_heavy queue). It:
+    1. Picks one node from the cluster as the "allowed" node
+    2. Launches with allowed_nodes.names restricting to that node
+    3. Verifies the pod landed on the allowed node
+    """
+    if smoke_tests_utils.is_non_docker_remote_api_server():
+        pytest.skip('Skipping test because the Kubernetes configs and '
+                    'credentials are located on the remote API server '
+                    'and not the machine where the test is running')
+
+    # Get node names directly from kubectl (independent of SkyPilot config,
+    # which the test framework may override via SKYPILOT_GLOBAL_CONFIG).
+    result = subprocess.run(
+        ['kubectl', 'get', 'nodes', '-o', 'jsonpath={.items[*].metadata.name}'],
+        capture_output=True,
+        text=True,
+        check=False)
+    if result.returncode != 0:
+        pytest.skip(f'kubectl failed: {result.stderr}')
+    node_names = result.stdout.strip().split()
+    if len(node_names) < 2:
+        pytest.skip('Need at least 2 nodes for allowed_nodes test')
+
+    allowed_node = node_names[0]
+    name = smoke_tests_utils.get_cluster_name()
+
+    test = smoke_tests_utils.Test(
+        'kubernetes_allowed_nodes',
+        [
+            # Launch with the allowed_nodes config (config_dict is
+            # automatically overlaid via override_sky_config and sent
+            # to the API server with each request).
+            f'sky launch -y -c {name}'
+            f' --infra kubernetes --cpus 0.5 --memory 1'
+            f' -- echo "hello from allowed node"',
+            f'sky logs {name} 1 --status',
+            # Verify the pod landed on the allowed node. We query by
+            # the annotation (which has the exact cluster name, unlike
+            # the label which includes a hash suffix) across all
+            # namespaces.
+            f'POD_NODE=$(kubectl get pods --all-namespaces -o'
+            f' jsonpath=\'{{range .items[*]}}'
+            f'{{.metadata.annotations.skypilot-cluster-name}}'
+            f' {{.spec.nodeName}}{{\"\\n\"}}{{end}}\''
+            f' | grep "^{name} " | awk \'{{print $2}}\') &&'
+            f' echo "Pod landed on: $POD_NODE" &&'
+            f' [ "$POD_NODE" = "{allowed_node}" ]',
+        ],
+        teardown=f'sky down -y {name}',
+        timeout=smoke_tests_utils.get_timeout('kubernetes'),
+        # Use config_dict to overlay allowed_nodes into the active
+        # config via the standard override_sky_config mechanism.
+        config_dict={
+            'kubernetes': {
+                'allowed_nodes': {
+                    'names': [allowed_node]
+                }
+            }
+        },
+    )
+    smoke_tests_utils.run_one_test(test)
 
 
 @pytest.mark.no_aws

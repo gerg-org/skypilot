@@ -1,7 +1,11 @@
 """Add api_access_tokens table.
 
 This migration creates a separate api_access_tokens table to store the token
+<<<<<<< HEAD
 ID of the API access token created for a managed job with api_access enabled,
+=======
+ID of the API access token created for a managed job with api_server_access,
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
 so the token can be cleaned up when the job completes.
 
 Revision ID: 016
