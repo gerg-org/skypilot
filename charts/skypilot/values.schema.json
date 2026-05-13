@@ -128,6 +128,9 @@
                 "resources": {
                     "type": "object"
                 },
+                "serveServerLog": {
+                    "type": "boolean"
+                },
                 "sidecarContainers": {
                     "type": [
                         "array",
@@ -160,6 +163,12 @@
                 },
                 "tolerations": {
                     "type": "array"
+                },
+                "topologySpreadTopologyKey": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
                 },
                 "upgradeStrategy": {
                     "type": "string"

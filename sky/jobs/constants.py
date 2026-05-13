@@ -2,8 +2,6 @@
 import os
 from typing import Any, Dict, Union
 
-from sky.skylet import constants as skylet_constants
-
 # Environment variable for JobGroup name, injected into all jobs in a JobGroup
 SKYPILOT_JOBGROUP_NAME_ENV_VAR = 'SKYPILOT_JOBGROUP_NAME'
 
@@ -64,6 +62,7 @@ JOBS_CLUSTER_NAME_PREFIX_LENGTH = 25
 # job.utils.ManagedJobCodeGen to handle the version update.
 # WARNING: If you update this due to a codegen change, make sure to make the
 # corresponding change in the ManagedJobsService AND bump the SKYLET_VERSION.
+<<<<<<< HEAD
 MANAGED_JOBS_VERSION = 16  # new fields for job graceful cancel
 
 # The command for setting up the jobs dashboard on the controller. It firstly
@@ -87,3 +86,6 @@ DASHBOARD_SETUP_CMD = (
     f'(nohup {skylet_constants.SKY_PYTHON_CMD} -m sky.jobs.dashboard.dashboard '
     '>> ~/.sky/job-dashboard.log 2>&1 &); '
     'fi')
+=======
+MANAGED_JOBS_VERSION = 17  # add collect_debug_dump_manifest for debug dump
+>>>>>>> 50eb0d79c4411420c375405d90086f54676925a7

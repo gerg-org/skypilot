@@ -189,6 +189,10 @@ apiService:
   # [Internal] Enable developer mode for SkyPilot
   skypilotDev: false
 
+  # Whether to save server logs to a file (/root/.sky/api_server/server.log)
+  # in addition to stdout. When false, logs are only written to stdout (container logs).
+  serveServerLog: true
+
   # Configure how to manage API server logs
   logs:
     retention:
@@ -205,6 +209,14 @@ apiService:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+
+  # Spread API server pods across topology domains (e.g., zones).
+  # When set, a topologySpreadConstraints entry is rendered with
+  # maxSkew=1, whenUnsatisfiable=DoNotSchedule, and a labelSelector
+  # that matches the API server pods automatically.
+  # Example: "topology.kubernetes.io/zone"
+  # @schema type: [string, null]
+  topologySpreadTopologyKey: null
 
 # Authentication configuration for the API server
 # Refer to https://docs.skypilot.co/en/latest/reference/auth.html for more details.

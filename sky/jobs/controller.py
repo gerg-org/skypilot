@@ -1804,6 +1804,7 @@ class ControllerManager:
             except Exception as e:  # pylint: disable=broad-except
                 error = e
 
+<<<<<<< HEAD
         # Clean up API access token if one was created for this job.
         def _cleanup_api_access_token(job_id: int):
             token_id = managed_job_state.get_api_access_token_id(job_id)
@@ -1816,6 +1817,20 @@ class ControllerManager:
         except Exception as e:  # pylint: disable=broad-except
             logger.warning(
                 f'Failed to revoke API access token for job {job_id}: {e}')
+=======
+        # Clean up API server access token if one was created for this job.
+        def _cleanup_api_server_access_token(job_id: int):
+            token_id = managed_job_state.get_api_access_token_id(job_id)
+            if token_id is not None:
+                global_user_state.delete_service_account_token(token_id)
+                logger.info(f'Revoked API server access token for job {job_id}')
+
+        try:
+            await asyncio.to_thread(_cleanup_api_server_access_token, job_id)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to revoke API server access token for '
+                           f'job {job_id}: {e}')
+>>>>>>> 50eb0d79c4411420c375405d90086f54676925a7
 
         if error is not None:
             # we only raise the last error that occurred, but its fine to lose
