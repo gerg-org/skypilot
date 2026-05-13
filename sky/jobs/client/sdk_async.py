@@ -103,6 +103,28 @@ async def cancel(
     request_id = await asyncio.to_thread(sdk.cancel, name, job_ids, all,
                                          all_users, pool, graceful,
                                          graceful_timeout)
+<<<<<<< HEAD
+=======
+    if stream_logs is not None:
+        return await sdk_async._stream_and_get(request_id, stream_logs)  # pylint: disable=protected-access
+    else:
+        return await sdk_async.get(request_id)
+
+
+@usage_lib.entrypoint
+async def wait(
+    name: Optional[str] = None,
+    job_id: Optional[int] = None,
+    timeout: Optional[int] = None,
+    poll_interval: int = 15,
+    task: Optional[Union[str, int]] = None,
+    stream_logs: Optional[
+        sdk_async.StreamConfig] = sdk_async.DEFAULT_STREAM_CONFIG,
+) -> int:
+    """Async version of wait() that waits for a managed job to finish."""
+    request_id = await asyncio.to_thread(sdk.wait, name, job_id, timeout,
+                                         poll_interval, task)
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
     if stream_logs is not None:
         return await sdk_async._stream_and_get(request_id, stream_logs)  # pylint: disable=protected-access
     else:

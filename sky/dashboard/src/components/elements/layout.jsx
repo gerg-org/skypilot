@@ -10,6 +10,13 @@ import {
 } from '@/hooks/useUpgradeDetection';
 import { installUpgradeInterceptor } from '@/utils/apiInterceptor';
 import { PluginSlot } from '@/plugins/PluginSlot';
+<<<<<<< HEAD
+=======
+import {
+  EVENT_NAVIGATION_READY,
+  EVENT_PLUGINS_LOADED,
+} from '@/data/connectors/constants';
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
 
 function DefaultNavbarLayout({ children }) {
   return (
@@ -29,17 +36,33 @@ function DefaultNavbarLayout({ children }) {
     </>
   );
 }
+<<<<<<< HEAD
+=======
+
+// Once plugins have settled in any LayoutContent instance, remember it on the
+// window so a remount (e.g. when a plugin registers an app-level wrapper into
+// PluginWrapperSlot, restructuring the tree) skips the gate immediately
+// instead of flashing bg-gray-50 for another settle cycle.
+const PLUGINS_SETTLED_FLAG = '__skydashboardPluginsSettled';
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
 
 function LayoutContent({ children, highlighted }) {
   const isMobile = useMobile();
   const { reportUpgrade, clearUpgrade } = useUpgradeDetection();
+<<<<<<< HEAD
   const [pluginsSettled, setPluginsSettled] = useState(false);
+=======
+  const [pluginsSettled, setPluginsSettled] = useState(
+    () => typeof window !== 'undefined' && window[PLUGINS_SETTLED_FLAG] === true
+  );
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
 
   // Install the fetch interceptor on mount
   useEffect(() => {
     installUpgradeInterceptor(reportUpgrade, clearUpgrade);
   }, [reportUpgrade, clearUpgrade]);
 
+<<<<<<< HEAD
   // Wait briefly for navigation plugins to register before showing layout.
   // A navigation plugin (e.g. sidebar) dispatches 'skydashboard:navigation-ready'
   // to cut the wait short. Otherwise we fall back after a timeout.
@@ -52,6 +75,35 @@ function LayoutContent({ children, highlighted }) {
       window.removeEventListener('skydashboard:navigation-ready', handler);
     };
   }, []);
+=======
+  // Wait for navigation plugins to register before showing layout.
+  // A navigation plugin (e.g. sidebar) dispatches 'skydashboard:navigation-ready'
+  // to cut the wait short. Otherwise we wait until all plugin scripts have
+  // finished loading ('skydashboard:plugins-loaded') so the sidebar plugin has
+  // a chance to register before falling back to the default top bar.
+  // A safety timeout prevents blocking indefinitely if plugin loading hangs.
+  useEffect(() => {
+    if (pluginsSettled) return undefined;
+    const settle = () => {
+      if (typeof window !== 'undefined') {
+        window[PLUGINS_SETTLED_FLAG] = true;
+      }
+      setPluginsSettled(true);
+    };
+    const timer = setTimeout(settle, 1000);
+    const handler = () => {
+      clearTimeout(timer);
+      settle();
+    };
+    window.addEventListener(EVENT_NAVIGATION_READY, handler, { once: true });
+    window.addEventListener(EVENT_PLUGINS_LOADED, handler, { once: true });
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener(EVENT_NAVIGATION_READY, handler);
+      window.removeEventListener(EVENT_PLUGINS_LOADED, handler);
+    };
+  }, [pluginsSettled]);
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
 
   if (!pluginsSettled) {
     return <div className="min-h-screen bg-gray-50" />;

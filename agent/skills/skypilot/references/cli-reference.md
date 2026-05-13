@@ -211,7 +211,11 @@ Tail the log of a job.
 - `--sync-down`, `-s` — Sync down the logs of a job to the local machine. For a distributed job, a separate log file from each worker will be downloaded.
 - `--status` — If specified, do not show logs but exit with a status code for the job's status: 0 for succeeded, or 1 for all other statuses.
 - `--follow`, `--no-follow` — Follow the logs of a job. If --no-follow is specified, print the log so far and exit. [default: --follow]
+<<<<<<< HEAD
 - `--tail` (default: `0`) — The number of lines to display from the end of the log file. Default is 0, which means print all lines.
+=======
+- `--tail` (default: `-1`) — Number of lines to display from the end of the log file. Default is the last 1000 lines — sensible for multi-GB logs where downloading the full file is slow. Pass --tail 0 to print the entire log.
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
 - `CLUSTER` — text
 - `JOB_IDS` — text
 
@@ -364,6 +368,10 @@ Tail or sync down the log of a managed job.
 - `--controller` — Show the controller logs of this job; useful for debugging launching/recoveries, etc.
 - `--refresh`, `-r` — Query the latest job logs, restarting the jobs controller if stopped.
 - `--sync-down`, `-s` — Download logs for all jobs shown in the queue.
+<<<<<<< HEAD
+=======
+- `--tail` (default: `-1`) — Number of lines to display from the end of the log file. Default is the last 1000 lines — sensible for multi-GB logs where downloading the full file is slow. Pass --tail 0 to print the entire log.
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
 - `JOB_ID` — integer
 - `TASK` — text
 
@@ -373,7 +381,11 @@ Tail or sync down the log of a managed job.
 
 ### `sky jobs pool apply`
 
+<<<<<<< HEAD
 Either apply a config to a pool for managed jobs submission     or update the number of workers in the pool. One of POOL_YAML or --workers     must be provided.
+=======
+Either apply a config to a pool for managed jobs submission or update the number of workers in the pool. One of POOL_YAML or --workers must be provided.
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
 
 **Options:**
 
@@ -737,10 +749,32 @@ Clean up a cluster set up with 'sky ssh up'.
 
 ### `sky ssh up`
 
+<<<<<<< HEAD
 Set up a cluster using SSH targets from a file. If not specified,     ~/.sky/ssh_node_pools.yaml will be used.
+=======
+Set up a cluster using SSH targets from a file. If not specified, ~/.sky/ssh_node_pools.yaml will be used.
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
 
 **Options:**
 
 - `--infra` — Name of the cluster to set up in ~/.sky/ssh_node_pools.yaml. If not specified, all clusters in the file will be set up.
 - `--async` — Run the command asynchronously.
 - `--file`, `-f` — The file containing the SSH targets.
+<<<<<<< HEAD
+=======
+
+## Other Commands
+
+### `sky debug-dump`
+
+Create a debug dump for troubleshooting. Creates a zip file containing logs, state, and configuration for the specified requests, clusters, and/or managed jobs. At least one of the filter options (--request-ids, --cluster-names, --job-ids, or --recent-minutes) must be provided.
+
+**Options:**
+
+- `--request-ids`, `-r` — Request IDs or prefixes to include in the dump.
+- `--cluster-names`, `-c` — Cluster names to include in the dump.
+- `--job-ids`, `-j` — Managed job IDs to include in the dump.
+- `--recent-minutes` — Include resources active within the last N minutes.
+- `--output` — Output path for the dump file.
+- `--async` — Run the command asynchronously.
+>>>>>>> fed792080c42a72ae783801ee7ac311c86a4e1ac
