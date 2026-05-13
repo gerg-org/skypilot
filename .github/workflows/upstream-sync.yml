@@ -184,12 +184,16 @@ jobs:
               # Remove the entire path from index AND working tree first so that
               # any extra files staged by the squash (e.g. upstream workflow files)
               # are fully gone before we restore our version from origin/main.
-              git rm -r --ignore-unmatch "$path" 2>/dev/null || true
+              # -f is required: without it, `git rm` refuses to remove files that
+              # have staged changes (e.g. auto-merged workflow files), which would
+              # leave upstream-only files in the tree to be re-committed.
+              git rm -rf --ignore-unmatch "$path" 2>/dev/null || true
               git checkout origin/main -- "$path"
             elif [[ "$op" == "upstream" ]]; then
               # Accept the upstream version wholesale — resolves any conflicts
-              # in these paths by overwriting with what upstream has.
-              git rm -r --ignore-unmatch "$path" 2>/dev/null || true
+              # in these paths by overwriting with what upstream has. -f is
+              # required for the same reason as the `restore` op above.
+              git rm -rf --ignore-unmatch "$path" 2>/dev/null || true
               git checkout "$UPSTREAM_SHA" -- "$path" 2>/dev/null || true
             else
               git rm --force --ignore-unmatch "$path"
