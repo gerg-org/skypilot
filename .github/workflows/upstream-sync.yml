@@ -113,12 +113,17 @@ jobs:
         run: |
           IS_MASTER="${{ steps.meta.outputs.is_master }}"
           BRANCH_CANDIDATE="${{ steps.meta.outputs.branch_candidate }}"
+          # --repo is required: we add `upstream` as a second github.com remote
+          # for the fetch step, and `gh pr list` without --repo can resolve to
+          # the wrong remote (querying skypilot-org/skypilot instead of this fork),
+          # which silently returns no matches.
+          REPO="${{ github.repository }}"
 
           if [[ "$IS_MASTER" == "true" ]]; then
-            DATA=$(gh pr list --base main --state open --json number,headRefName \
+            DATA=$(gh pr list --repo "$REPO" --base main --state open --json number,headRefName \
               | jq '[.[] | select(.headRefName | startswith("upstream-sync/"))] | first // {}')
           else
-            DATA=$(gh pr list --base main --state open --json number,headRefName \
+            DATA=$(gh pr list --repo "$REPO" --base main --state open --json number,headRefName \
               | jq --arg b "$BRANCH_CANDIDATE" \
               '[.[] | select(.headRefName == $b)] | first // {}')
           fi
