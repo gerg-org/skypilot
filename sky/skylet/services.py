@@ -530,7 +530,12 @@ class ManagedJobsServiceImpl(managed_jobsv1_pb2_grpc.ManagedJobsServiceServicer
                                                   external_ip=ip_pair[1])
                         for ip_pair in (job.get('internal_external_ips') or [])
                     ],
+<<<<<<< HEAD
                     internal_services=job.get('internal_services') or {})
+=======
+                    internal_services=job.get('internal_services') or {},
+                    priority_class=job.get('priority_class'))
+>>>>>>> 7808630629cd84f5f0761d21f684b11432a84354
                 jobs_info.append(job_info)
 
             return managed_jobsv1_pb2.GetJobTableResponse(
