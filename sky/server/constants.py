@@ -10,7 +10,11 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
+<<<<<<< HEAD
 API_VERSION = 42  # api_access support for managed jobs
+=======
+API_VERSION = 45  # jobs.wait support
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -36,7 +40,11 @@ MIN_RECIPE_LAUNCH_API_VERSION = 33
 # Minimum API version that supports upload API v2.
 UPLOAD_API_V2_VERSION = 41
 
+<<<<<<< HEAD
 # Minimum server API version required for api_access in managed jobs.
+=======
+# Minimum server API version required for api_server_access in managed jobs.
+>>>>>>> 035ad79b04152da70c72badcde7402caec7362ad
 MIN_API_ACCESS_API_VERSION = 42
 
 # Prefix for API request names.
