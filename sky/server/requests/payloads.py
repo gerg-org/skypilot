@@ -517,6 +517,7 @@ class VolumeApplyBody(RequestBody):
     config: Optional[Dict[str, Any]] = None
     labels: Optional[Dict[str, str]] = None
     use_existing: Optional[bool] = None
+    creation_yaml: Optional[str] = None
 
 
 class VolumeDeleteBody(RequestBody):
@@ -572,6 +573,10 @@ class JobsLaunchBody(RequestBody):
             self.env_vars,
             workdir_only=False,
             file_mounts_blob_id=self.file_mounts_blob_id)
+        # Pass the blob id through so that consolidation-mode submissions can
+        # record it on the job and keep the blob alive until the job is
+        # terminal.
+        kwargs['file_mounts_blob_id'] = self.file_mounts_blob_id
         return kwargs
 
 
@@ -624,6 +629,19 @@ class JobsLogsBody(RequestBody):
     refresh: bool = False
     tail: Optional[int] = None
     # Task identifier: int for task_id, str for task_name
+    task: Optional[Union[str, int]] = None
+
+
+class JobsWaitBody(RequestBody):
+    """The request body for the jobs wait endpoint."""
+    name: Optional[str] = None
+    job_id: Optional[int] = None
+    # Timeout in seconds. None means wait forever.
+    timeout: Optional[int] = None
+    # Polling interval in seconds. Minimum 5, default 15.
+    poll_interval: int = 15
+    # Task identifier for JobGroups: int for task_id, str for task_name.
+    # If None, waits for all tasks.
     task: Optional[Union[str, int]] = None
 
 
@@ -896,6 +914,16 @@ class CostReportBody(RequestBody):
     # Only return fields that are needed for the dashboard
     # summary page
     dashboard_summary_response: bool = False
+
+
+class CreateDebugDumpBody(RequestBody):
+    """The request body for the debug dump init endpoint."""
+    request_ids: Optional[List[str]] = None
+    cluster_names: Optional[List[str]] = None
+    managed_job_ids: Optional[List[int]] = None
+    recent_minutes: Optional[float] = None
+    # Client-side info for troubleshooting (version, config, environment)
+    client_info: Optional[Dict[str, Any]] = None
 
 
 class RequestPayload(BasePayload):

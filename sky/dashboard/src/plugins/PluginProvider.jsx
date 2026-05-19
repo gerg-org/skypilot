@@ -15,6 +15,11 @@ import dashboardCache from '@/lib/cache';
 import cachePreloader from '@/lib/cache-preloader';
 import { checkGrafanaAvailability, getGrafanaUrl } from '@/utils/grafana';
 import { canonicalizeGpuName, CANONICAL_GPU_NAMES } from '@/utils/gpuUtils';
+import {
+  trackEvent,
+  trackPluginPageView,
+  registerAnalyticsProvider,
+} from '@/lib/analytics';
 
 const PluginContext = createContext({
   topNavLinks: [],
@@ -516,7 +521,13 @@ function interceptHistoryApi() {
       normalizedUrl = normalizeUrlForHistory(url);
     }
     try {
-      return originalPushState.call(this, state, title, normalizedUrl);
+      const result = originalPushState.call(this, state, title, normalizedUrl);
+      window.dispatchEvent(
+        new CustomEvent('skydashboard:url-changed', {
+          detail: { url: normalizedUrl || url },
+        })
+      );
+      return result;
     } catch (error) {
       // If pushState still fails (e.g., due to origin mismatch), try with a relative URL
       if (
@@ -527,7 +538,18 @@ function interceptHistoryApi() {
         try {
           const urlObj = new URL(normalizedUrl, window.location.href);
           const relativeUrl = urlObj.pathname + urlObj.search + urlObj.hash;
-          return originalPushState.call(this, state, title, relativeUrl);
+          const result = originalPushState.call(
+            this,
+            state,
+            title,
+            relativeUrl
+          );
+          window.dispatchEvent(
+            new CustomEvent('skydashboard:url-changed', {
+              detail: { url: relativeUrl },
+            })
+          );
+          return result;
         } catch {
           // If that also fails, rethrow the original error
           throw error;
@@ -544,7 +566,18 @@ function interceptHistoryApi() {
       normalizedUrl = normalizeUrlForHistory(url);
     }
     try {
-      return originalReplaceState.call(this, state, title, normalizedUrl);
+      const result = originalReplaceState.call(
+        this,
+        state,
+        title,
+        normalizedUrl
+      );
+      window.dispatchEvent(
+        new CustomEvent('skydashboard:url-changed', {
+          detail: { url: normalizedUrl || url },
+        })
+      );
+      return result;
     } catch (error) {
       // If replaceState still fails (e.g., due to origin mismatch), try with a relative URL
       if (
@@ -555,7 +588,18 @@ function interceptHistoryApi() {
         try {
           const urlObj = new URL(normalizedUrl, window.location.href);
           const relativeUrl = urlObj.pathname + urlObj.search + urlObj.hash;
-          return originalReplaceState.call(this, state, title, relativeUrl);
+          const result = originalReplaceState.call(
+            this,
+            state,
+            title,
+            relativeUrl
+          );
+          window.dispatchEvent(
+            new CustomEvent('skydashboard:url-changed', {
+              detail: { url: relativeUrl },
+            })
+          );
+          return result;
         } catch {
           // If that also fails, rethrow the original error
           throw error;
@@ -708,6 +752,15 @@ function createPluginApi(dispatch) {
       // eslint-disable-next-line no-undef
       return require('@/components/ui');
     },
+    trackEvent(eventName, properties = {}) {
+      trackEvent(eventName, properties);
+    },
+    trackPluginPageView(pluginName, pagePath) {
+      trackPluginPageView(pluginName, pagePath);
+    },
+    registerAnalyticsProvider(provider) {
+      registerAnalyticsProvider(provider);
+    },
     registerRecipeType(config) {
       if (!config || !config.id || !config.label) {
         console.warn(
@@ -744,6 +797,8 @@ function createPluginApi(dispatch) {
         id: String(config.id),
         name: config.name || config.id,
         useHook: config.useHook,
+        hooks: config.hooks || {},
+        components: config.components || {},
       };
       dispatch({
         type: actions.REGISTER_DATA_PROVIDER,
@@ -781,17 +836,26 @@ export function PluginProvider({ children }) {
     }
   }, []);
 
-  // Expose state reference for getDataEnhancements to access outside React context
+  // Expose state reference for plugins to access outside React context.
+  // Use a stable ref updated during render (not in useEffect) so that child
+  // components' effects always read the latest state — even on the same commit
+  // that first mounts them.  The previous approach (useEffect with [state] dep)
+  // deleted and recreated __pluginStateRef on every state change; because React
+  // runs all cleanups before all new effects (children-first), a child mounting
+  // on the same render would read undefined during its effect.
+  const pluginStateRef = useRef(state);
+  pluginStateRef.current = state;
+
   useEffect(() => {
     if (typeof window !== 'undefined') {
-      window.__pluginStateRef = { current: state };
+      window.__pluginStateRef = pluginStateRef;
       return () => {
-        if (window.__pluginStateRef) {
+        if (window.__pluginStateRef === pluginStateRef) {
           delete window.__pluginStateRef;
         }
       };
     }
-  }, [state]);
+  }, []);
 
   // Persist nav links to localStorage after plugins have fully loaded
   useEffect(() => {
@@ -840,6 +904,10 @@ export function PluginProvider({ children }) {
       if (!cancelled) {
         pluginsLoadedRef.current = true;
         dispatch({ type: actions.CLEAR_CACHED_NAV_LINKS });
+        // Signal that all plugin scripts have finished loading.
+        // layout.jsx listens for this to avoid showing the fallback top bar
+        // before the sidebar plugin has had a chance to register.
+        window.dispatchEvent(new CustomEvent('skydashboard:plugins-loaded'));
       }
     };
     void bootstrapPlugins();
