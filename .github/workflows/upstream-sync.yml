@@ -156,11 +156,69 @@ jobs:
         run: |
           UPSTREAM_SHA="${{ steps.meta.outputs.upstream_sha }}"
           UPSTREAM_REF="${{ steps.meta.outputs.upstream_ref }}"
+          # Dereference UPSTREAM_SHA to a commit (it may be an annotated tag SHA
+          # from ls-remote — high-level merge commands dereference automatically,
+          # but plumbing commands like merge-tree expect a commit.)
+          UPSTREAM_COMMIT=$(git rev-parse "$UPSTREAM_SHA^{commit}")
 
+          # ── Resolve previously synced upstream commit (for merge base) ──────
+          # Past upstream imports landed on main as squash commits — they have
+          # no parent link back to upstream. Without intervention,
+          # `git merge-base origin/main $UPSTREAM_SHA` walks all the way back
+          # to upstream's pre-sync history, producing tons of spurious
+          # add/add and modify/modify conflicts in files the fork never touched
+          # (the 3-way merge ends up replaying every upstream change since that
+          # ancient base against itself).
+          #
+          # Fix: find the previously synced upstream SHA from the most recent
+          # squash commit message and pass it to `git merge-tree --merge-base`
+          # as the explicit 3-way base. This produces a tree that contains only
+          # the genuine PREV_SHA..UPSTREAM_SHA diff applied on top of our tree.
+          PREV_MSG=$(git log origin/main --grep="^chore: squash-merge upstream/" -1 --format=%B || true)
+          PREV_SHA=""
+          if [[ -n "$PREV_MSG" ]]; then
+            # New format (this workflow): "(sha: <40hex>)"
+            PREV_SHA=$(printf '%s' "$PREV_MSG" | grep -oE 'sha: [0-9a-f]{40}' | head -1 | awk '{print $2}')
+            if [[ -z "$PREV_SHA" ]]; then
+              # Legacy format: parse "upstream/<ref>" from subject and resolve via tag/branch.
+              PREV_REF=$(printf '%s' "$PREV_MSG" | head -1 \
+                | grep -oE 'upstream/[A-Za-z0-9._/-]+' | head -1 | sed 's|^upstream/||')
+              if [[ -n "$PREV_REF" ]]; then
+                PREV_SHA=$(git rev-parse "refs/tags/$PREV_REF^{commit}" 2>/dev/null \
+                  || git rev-parse "refs/remotes/upstream/$PREV_REF^{commit}" 2>/dev/null \
+                  || true)
+              fi
+            fi
+          fi
+
+          # ── Run 3-way merge via merge-tree (explicit base) ──────────────────
+          # merge-tree writes the merged tree to the object DB and returns its SHA
+          # on stdout (with --name-only, conflicted paths follow on next lines).
+          # Exit code: 0 = clean, 1 = conflicts, ≥128 = error.
+          # Using --merge-base lets us pass the PREV_SHA explicitly even when it's
+          # not a natural ancestor of UPSTREAM_COMMIT (e.g. upstream tags live on
+          # separate release branches, not on master).
           set +e
-          git merge --squash "$UPSTREAM_SHA"
+          if [[ -n "$PREV_SHA" ]] && [[ "$PREV_SHA" != "$UPSTREAM_COMMIT" ]]; then
+            echo "Using PREV_SHA $PREV_SHA as explicit merge base"
+            MERGE_OUT=$(git merge-tree --write-tree --name-only \
+              --merge-base="$PREV_SHA" HEAD "$UPSTREAM_COMMIT")
+          else
+            echo "::warning::No previous upstream sync SHA found — falling back to natural merge base. Expect more conflicts than usual."
+            MERGE_OUT=$(git merge-tree --write-tree --name-only HEAD "$UPSTREAM_COMMIT")
+          fi
           MERGE_RC=$?
           set -e
+
+          MERGED_TREE=$(printf '%s\n' "$MERGE_OUT" | head -1)
+          # Conflicted paths are on lines 2..N, terminated by a blank line.
+          CONFLICTED_FILES=$(printf '%s\n' "$MERGE_OUT" | awk 'NR==1{next} /^$/{exit} {print}')
+
+          # Materialize the merged tree into the working tree and index.
+          # --reset is required: read-tree -u refuses to overwrite untracked
+          # files (none expected here, but be defensive) and to discard any
+          # stale index state from the fresh checkout.
+          git read-tree -u --reset "$MERGED_TREE"
 
           # ── Upstream blocklist ──────────────────────────────────────────────
           # Files/dirs to drop or restore on every sync. Adding an entry here
@@ -207,10 +265,11 @@ jobs:
           # ───────────────────────────────────────────────────────────────────
 
           if [[ $MERGE_RC -ne 0 ]]; then
-            # Capture unmerged files BEFORE `git add -A`, because staging
-            # resolves the unmerged state and bakes conflict markers into
-            # the index as regular content — making --diff-filter=U useless.
-            CONFLICTS=$(git diff --name-only --diff-filter=U | grep -Ev "$SKIP_PATTERN" || true)
+            # CONFLICTED_FILES comes from merge-tree's --name-only output.
+            # Filter against SKIP_PATTERN to drop blocklisted paths (which the
+            # BLOCKLIST loop above already resolved by overwriting their tree
+            # entries).
+            CONFLICTS=$(printf '%s\n' "$CONFLICTED_FILES" | grep -Ev "$SKIP_PATTERN" || true)
           else
             CONFLICTS=""
           fi
@@ -224,18 +283,18 @@ jobs:
 
               # Commit the conflicted state so the PR diff shows what needs fixing.
               # CI will fail on this branch — that is intentional.
-              git commit -m "chore: squash-merge upstream/$UPSTREAM_REF [CONFLICTS — manual resolution required]"
+              git commit -m "chore: squash-merge upstream/$UPSTREAM_REF (sha: $UPSTREAM_SHA) [CONFLICTS — manual resolution required]"
             else
               echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
               echo "conflict_files="     >> "$GITHUB_OUTPUT"
-              git commit -m "chore: squash-merge upstream/$UPSTREAM_REF"
+              git commit -m "chore: squash-merge upstream/$UPSTREAM_REF (sha: $UPSTREAM_SHA)"
             fi
           else
             echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
             echo "conflict_files="     >> "$GITHUB_OUTPUT"
 
             if ! git diff --cached --quiet; then
-              git commit -m "chore: squash-merge upstream/$UPSTREAM_REF"
+              git commit -m "chore: squash-merge upstream/$UPSTREAM_REF (sha: $UPSTREAM_SHA)"
             else
               echo "Nothing to commit — upstream is already in sync with main."
             fi
