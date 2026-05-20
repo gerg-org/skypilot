@@ -29,6 +29,7 @@ import { getPoolStatus } from '@/data/connectors/jobs';
 import jobsCacheManager from '@/lib/jobs-cache-manager';
 import { getClusters, downloadJobLogs } from '@/data/connectors/clusters';
 import { getWorkspaces } from '@/data/connectors/workspaces';
+import { getUsers } from '@/data/connectors/users';
 import {
   CustomTooltip as Tooltip,
   NonCapitalizedTooltip,
@@ -70,6 +71,7 @@ import {
   buildFilterUrl,
   evaluateCondition,
 } from '@/components/shared/FilterSystem';
+import { trackJobAction, trackFilterUsed } from '@/lib/analytics';
 
 // Define status groups for active and finished jobs
 export const statusGroups = {
@@ -147,6 +149,10 @@ export function getAggregatedStatus(tasks) {
 
 // Define filter options for the filter dropdown
 const PROPERTY_OPTIONS = [
+  {
+    label: 'ID',
+    value: 'id',
+  },
   {
     label: 'Name',
     value: 'name',
@@ -327,9 +333,15 @@ export function ManagedJobs() {
     sharedUpdateURLParams(router, filters);
   };
 
+  // Track only the newly added filter (called from FilterDropdown callbacks)
+  const trackNewFilter = (property, value) => {
+    trackFilterUsed('job', { property, value });
+  };
+
   const updateFiltersByURLParams = React.useCallback(() => {
     const propertyMap = new Map();
     propertyMap.set('', '');
+    propertyMap.set('id', 'ID');
     propertyMap.set('status', 'Status');
     propertyMap.set('name', 'Name');
     propertyMap.set('user', 'User');
@@ -360,12 +372,13 @@ export function ManagedJobs() {
             Managed Jobs
           </Link>
         </div>
-        <div className="w-full sm:w-auto">
+        <div className="w-full sm:w-auto max-w-lg">
           <FilterDropdown
             propertyList={PROPERTY_OPTIONS}
             valueList={valueList}
             setFilters={setFilters}
             updateURLParams={updateURLParams}
+            onFilterAdd={trackNewFilter}
             placeholder="Filter jobs"
           />
         </div>
@@ -542,8 +555,10 @@ export function ManagedJobsTable({
         };
 
         // Build params for jobsCacheManager
+        const jobIdFilter = getFilterValue('id');
         const params = {
           allUsers: true,
+          jobIdMatch: jobIdFilter,
           nameMatch: getFilterValue('name'),
           userMatch: getFilterValue('user'),
           workspaceMatch: getFilterValue('workspace'),
@@ -815,6 +830,26 @@ export function ManagedJobsTable({
       workspace: Array.from(workspaces).sort(),
       pool: Array.from(pools).sort(),
       labels: Array.from(labels).sort(),
+    });
+
+    // Fetch full users/workspaces from cache (preloaded by cache-preloader).
+    // dashboardCache.get() returns cached data if fresh, or re-fetches if
+    // expired. Updates only user/workspace to avoid blocking other fields.
+    Promise.all([
+      dashboardCache.get(getUsers, []),
+      dashboardCache.get(getWorkspaces, []),
+    ]).then(([usersData, workspacesData]) => {
+      setValueList((prev) => ({
+        ...prev,
+        user: usersData
+          ? [
+              ...new Set(usersData.map((u) => u.username).filter(Boolean)),
+            ].sort()
+          : prev.user,
+        workspace: workspacesData
+          ? Object.keys(workspacesData).sort()
+          : prev.workspace,
+      }));
     });
   }, [data, poolsData, setValueList]);
 
@@ -2085,6 +2120,7 @@ export function Status2Actions({
   const handleLogsClick = (e, type) => {
     e.preventDefault();
     e.stopPropagation();
+    trackJobAction('view_logs', { jobId });
     router.push({
       pathname: `${jobParent}/${jobId}`,
       query: { tab: type },
@@ -2094,6 +2130,7 @@ export function Status2Actions({
   const handleDownloadLogs = (e, controller = false) => {
     e.preventDefault();
     e.stopPropagation();
+    trackJobAction('download_logs', { jobId });
 
     if (managed) {
       // For managed jobs
@@ -2138,6 +2175,7 @@ export function Status2Actions({
         <button
           onClick={(e) => handleDownloadLogs(e, false)}
           className="text-sky-blue hover:text-sky-blue-bright font-medium inline-flex items-center h-8"
+          title="Download logs"
         >
           <Download className="w-4 h-4" />
           {withLabel && <span className="ml-1.5">Download</span>}

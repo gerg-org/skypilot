@@ -142,6 +142,11 @@ message ManagedJobInfo {
   // K8s DNS entries mapping instance_id to internal_svc
   // Only populated for Kubernetes clusters
   map<string, string> internal_services = 36;
+<<<<<<< HEAD
+=======
+  // Named priority class for job scheduling
+  optional string priority_class = 37;
+>>>>>>> cfa6c120e434fde9bbbec2b904b23a0ac89b4c98
 }
 
 // A pair of internal and external IP addresses

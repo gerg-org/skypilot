@@ -130,6 +130,7 @@ job_info_table = sqlalchemy.Table(
     sqlalchemy.Column('priority',
                       sqlalchemy.Integer,
                       server_default=str(constants.DEFAULT_PRIORITY)),
+    sqlalchemy.Column('priority_class', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('entrypoint', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('original_user_yaml_path',
                       sqlalchemy.Text,
@@ -298,6 +299,7 @@ def _get_jobs_dict(r: 'row.RowMapping') -> Dict[str, Any]:
         'user_hash': r.get('user_hash'),
         'workspace': r.get('workspace'),
         'priority': r.get('priority'),
+        'priority_class': r.get('priority_class'),
         'entrypoint': r.get('entrypoint'),
         'original_user_yaml_path': r.get('original_user_yaml_path'),
         'original_user_yaml_content': r.get('original_user_yaml_content'),
@@ -1676,6 +1678,7 @@ def get_task_specs(job_id: int, task_id: int) -> Dict[str, Any]:
         return json.loads(task_specs[0])
 
 
+<<<<<<< HEAD
 def scheduler_set_waiting(job_ids: List[int], dag_yaml_content: str,
                           original_user_yaml_content: str,
                           env_file_content: str,
@@ -1683,18 +1686,32 @@ def scheduler_set_waiting(job_ids: List[int], dag_yaml_content: str,
                           priority: int) -> None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+=======
+def scheduler_set_waiting(job_ids: List[int],
+                          dag_yaml_content: str,
+                          original_user_yaml_content: str,
+                          env_file_content: str,
+                          config_file_content: Optional[str],
+                          priority: int,
+                          priority_class: Optional[str] = None) -> None:
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        updates = {
+            job_info_table.c.schedule_state:
+                ManagedJobScheduleState.WAITING.value,
+            job_info_table.c.dag_yaml_content: dag_yaml_content,
+            job_info_table.c.original_user_yaml_content:
+                (original_user_yaml_content),
+            job_info_table.c.env_file_content: env_file_content,
+            job_info_table.c.config_file_content: config_file_content,
+            job_info_table.c.priority: priority,
+        }
+        if priority_class is not None:
+            updates[job_info_table.c.priority_class] = priority_class
+>>>>>>> cfa6c120e434fde9bbbec2b904b23a0ac89b4c98
         updated_count = session.query(job_info_table).filter(
-            sqlalchemy.and_(job_info_table.c.spot_job_id.in_(job_ids),)).update(
-                {
-                    job_info_table.c.schedule_state:
-                        ManagedJobScheduleState.WAITING.value,
-                    job_info_table.c.dag_yaml_content: dag_yaml_content,
-                    job_info_table.c.original_user_yaml_content:
-                        (original_user_yaml_content),
-                    job_info_table.c.env_file_content: env_file_content,
-                    job_info_table.c.config_file_content: config_file_content,
-                    job_info_table.c.priority: priority,
-                })
+            sqlalchemy.and_(
+                job_info_table.c.spot_job_id.in_(job_ids),)).update(updates)
         session.commit()
         assert updated_count == len(job_ids), (job_ids, updated_count)
 
@@ -1858,10 +1875,29 @@ async def get_pool_submit_info_async(
 def set_api_access_token_id(job_id: int, token_id: str) -> None:
     """Store the API access token ID for a managed job."""
     engine = _db_manager.get_engine()
+<<<<<<< HEAD
     with orm.Session(engine) as session:
         session.execute(
             sqlalchemy.insert(api_access_token_table).values(job_id=job_id,
                                                              token_id=token_id))
+=======
+    dialect_map = {
+        db_utils.SQLAlchemyDialect.SQLITE.value: sqlite.insert,
+        db_utils.SQLAlchemyDialect.POSTGRESQL.value: postgresql.insert,
+    }
+    insert_func = dialect_map.get(engine.dialect.name)
+    if insert_func is None:
+        raise ValueError(f'Unsupported database dialect: {engine.dialect.name}')
+    with orm.Session(engine) as session:
+        insert_stmt = insert_func(api_access_token_table).values(
+            job_id=job_id, token_id=token_id)
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[api_access_token_table.c.job_id],
+            set_={
+                api_access_token_table.c.token_id: insert_stmt.excluded.token_id
+            })
+        session.execute(upsert_stmt)
+>>>>>>> cfa6c120e434fde9bbbec2b904b23a0ac89b4c98
         session.commit()
 
 
@@ -2305,6 +2341,7 @@ async def set_recovering_async(
     cluster_event_reason: Optional[str] = None,
 ):
     """Set the task to recovering state, and update the job duration."""
+<<<<<<< HEAD
     # Build code and reason from external failures for the event log
     code = None
     reason_parts = []
@@ -2316,6 +2353,18 @@ async def set_recovering_async(
         reason_parts.append(external_failure_reason)
     if reason_parts:
         reason = ': '.join(reason_parts)
+=======
+    # Build code and reason from external failures for the event log.
+    # Prefer external_failures over cluster_event_reason to avoid
+    # duplicating the same message when a plugin writes the same reason
+    # to both cluster events and cluster failures.
+    code = None
+    if external_failures:
+        code = '; '.join(f.code for f in external_failures)
+        reason = '; '.join(f.reason for f in external_failures)
+    elif cluster_event_reason:
+        reason = cluster_event_reason
+>>>>>>> cfa6c120e434fde9bbbec2b904b23a0ac89b4c98
     else:
         assert code is None, 'Code should be None if there are no reasons.'
         reason = 'Cluster preempted or failed, recovering'

@@ -1226,11 +1226,15 @@ class JobController:
             if tasks_to_launch:
                 logger.info(f'Phase 1: Launching clusters for tasks '
                             f'{tasks_to_launch}...')
+                # Each launch gets its own SkyPilotContext copy so that
+                # the env-var pop/restore in _launch() doesn't race
+                # across concurrent tasks sharing the same context.
                 launch_coros = []
                 for task_id in tasks_to_launch:
                     executor = strategy_executors[task_id]
                     if executor is not None:
-                        launch_coros.append(executor.launch())
+                        launch_coros.append(
+                            context.contextual_async(executor.launch)())
 
                 if launch_coros:
                     results = await asyncio.gather(*launch_coros,
@@ -1804,6 +1808,7 @@ class ControllerManager:
             except Exception as e:  # pylint: disable=broad-except
                 error = e
 
+<<<<<<< HEAD
         # Clean up API access token if one was created for this job.
         def _cleanup_api_access_token(job_id: int):
             token_id = managed_job_state.get_api_access_token_id(job_id)
@@ -1816,6 +1821,20 @@ class ControllerManager:
         except Exception as e:  # pylint: disable=broad-except
             logger.warning(
                 f'Failed to revoke API access token for job {job_id}: {e}')
+=======
+        # Clean up API server access token if one was created for this job.
+        def _cleanup_api_server_access_token(job_id: int):
+            token_id = managed_job_state.get_api_access_token_id(job_id)
+            if token_id is not None:
+                global_user_state.delete_service_account_token(token_id)
+                logger.info(f'Revoked API server access token for job {job_id}')
+
+        try:
+            await asyncio.to_thread(_cleanup_api_server_access_token, job_id)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to revoke API server access token for '
+                           f'job {job_id}: {e}')
+>>>>>>> cfa6c120e434fde9bbbec2b904b23a0ac89b4c98
 
         if error is not None:
             # we only raise the last error that occurred, but its fine to lose
