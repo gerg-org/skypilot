@@ -78,9 +78,18 @@ export default function PluginCatchAllPage() {
           );
         }
       }
+<<<<<<< HEAD
       if (container) {
         container.innerHTML = '';
       }
+=======
+      // Don't manually clear container.innerHTML — when a plugin uses
+      // ReactDOM.createRoot(container).render(...), React 18 manages the
+      // children itself and will clean them up on root.unmount(). Wiping
+      // innerHTML afterwards races with React's reconciliation and
+      // produces "Failed to execute 'removeChild' on 'Node'" errors that
+      // abort the in-flight Next.js navigation.
+>>>>>>> 09d2055c63b418a101eb68049dac4084fe46859d
     };
   }, [route, pathname]);
 
