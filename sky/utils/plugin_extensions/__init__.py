@@ -8,11 +8,19 @@ from sky.utils.plugin_extensions.external_failure_source import (
 from sky.utils.plugin_extensions.external_failure_source import (
     ExternalFailureSource)
 from sky.utils.plugin_extensions.node_info_source import NodeInfoSource
+<<<<<<< HEAD
+=======
+from sky.utils.plugin_extensions.pod_info_source import PodInfoSource
+>>>>>>> 565532c59288d5cfcd7dc58814aa93f7129f89ab
 from sky.utils.plugin_extensions.recipe_validator import RecipeValidator
 
 __all__ = [
     'ExternalClusterFailure',
     'ExternalFailureSource',
     'NodeInfoSource',
+<<<<<<< HEAD
+=======
+    'PodInfoSource',
+>>>>>>> 565532c59288d5cfcd7dc58814aa93f7129f89ab
     'RecipeValidator',
 ]

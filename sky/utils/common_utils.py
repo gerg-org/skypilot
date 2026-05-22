@@ -37,11 +37,14 @@ from sky.utils import ux_utils
 from sky.utils import validator
 
 if typing.TYPE_CHECKING:
+    import webbrowser
+
     import jinja2
     import psutil
 else:
     jinja2 = adaptors_common.LazyImport('jinja2')
     psutil = adaptors_common.LazyImport('psutil')
+    webbrowser = adaptors_common.LazyImport('webbrowser')
 
 USER_HASH_FILE = os.path.expanduser('~/.sky/user_hash')
 USER_HASH_LENGTH = 8
@@ -192,6 +195,20 @@ def check_cluster_name_is_valid(cluster_name: Optional[str]) -> None:
                 f'{valid_regex}')
 
 
+def cluster_name_looks_like_file_path(cluster_name: Optional[str]) -> bool:
+    """Returns True if the cluster name looks like a file path.
+
+    This detects a common user mistake: typing 'sky launch -c job.yaml'
+    instead of 'sky launch -c mycluster job.yaml'.
+    """
+    if cluster_name is None:
+        return False
+
+    file_extensions = ('.yaml', '.yml', '.json')
+    return (cluster_name.lower().endswith(file_extensions) or
+            os.path.isfile(os.path.expanduser(cluster_name)))
+
+
 def check_recipe_name_is_valid(recipe_name: Optional[str]) -> None:
     """Errors out on invalid recipe names.
 
@@ -219,6 +236,39 @@ def check_recipe_name_is_valid(recipe_name: Optional[str]) -> None:
                 f'Recipe name "{recipe_name}" is invalid; '
                 'ensure it is fully matched by regex (e.g., '
                 'only contains letters, numbers, and dashes).')
+<<<<<<< HEAD
+=======
+
+
+def check_workspace_name_is_valid(workspace_name: Optional[str]) -> None:
+    """Errors out on invalid workspace names.
+
+    Workspace names must:
+    - Start with a lowercase letter
+    - Contain only lowercase letters, numbers, dashes, and underscores
+    - End with a lowercase letter or number
+    - Be at most constants.WORKSPACE_NAME_MAX_LENGTH characters
+
+    Raises:
+        exceptions.InvalidWorkspaceNameError: If the workspace name is invalid.
+    """
+    if workspace_name is None:
+        return
+    if len(workspace_name) > constants.WORKSPACE_NAME_MAX_LENGTH:
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.InvalidWorkspaceNameError(
+                f'Workspace name "{workspace_name}" is too long; '
+                f'maximum length is {constants.WORKSPACE_NAME_MAX_LENGTH} '
+                f'characters, got {len(workspace_name)}')
+    valid_regex = constants.WORKSPACE_NAME_VALID_REGEX
+    if re.fullmatch(valid_regex, workspace_name) is None:
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.InvalidWorkspaceNameError(
+                f'Workspace name "{workspace_name}" is invalid; '
+                'ensure it starts with a lowercase letter, ends with '
+                'a lowercase letter or number, and contains only '
+                'lowercase letters, numbers, dashes, and underscores.')
+>>>>>>> 565532c59288d5cfcd7dc58814aa93f7129f89ab
 
 
 def make_cluster_name_on_cloud(display_name: str,
@@ -758,6 +808,43 @@ def is_wsl() -> bool:
     return 'microsoft' in platform.uname().release.lower()
 
 
+def open_browser(url: str) -> bool:
+    """Open a URL in the default browser, with WSL support.
+
+    On WSL, Python's webbrowser module tries xdg-open which fails because
+    there are no GUI browsers in the Linux environment. This function detects
+    WSL and uses Windows-side browser opening instead.
+
+    Returns:
+        True if the browser was likely opened successfully, False otherwise.
+    """
+    if is_wsl():
+        # On WSL, use Windows-side browser opening.
+        # Try wslview (from wslu package) first, then powershell.exe.
+        for cmd in [
+            ['wslview', url],
+            ['powershell.exe', '/c', 'start', url],
+            ['cmd.exe', '/c', 'start', url],
+        ]:
+            try:
+                logger.debug(f'trying to open browser via {cmd}')
+                result = subprocess.run(cmd,
+                                        capture_output=True,
+                                        timeout=10,
+                                        check=False)
+                if result.returncode == 0:
+                    return True
+            except FileNotFoundError:
+                logger.debug(f'{cmd[0]} failed', exc_info=True)
+                continue
+            except Exception:  # pylint: disable=broad-except
+                logger.debug('failed', exc_info=True)
+                continue
+        return False
+
+    return webbrowser.open(url)
+
+
 def find_free_port(start_port: int) -> int:
     """Finds first free local port starting with 'start_port'.
 
@@ -829,23 +916,34 @@ def validate_schema(obj, schema, err_msg_prefix='', skip_none=True):
                 known_fields = set(e.schema.get('properties', {}).keys())
                 assert isinstance(e.instance,
                                   dict), 'Instance must be a dictionary'
+                sub_msgs = []
                 for field in e.instance:
                     if field not in known_fields:
                         most_similar_field = difflib.get_close_matches(
                             field, known_fields, 1)
                         if most_similar_field:
-                            err_msg += (f'Instead of {field!r}, did you mean '
-                                        f'{most_similar_field[0]!r}?')
+                            sub_msgs.append(
+                                f'Instead of {field!r}, did you mean '
+                                f'{most_similar_field[0]!r}?')
                         else:
-                            err_msg += f'Found unsupported field {field!r}.'
+                            sub_msgs.append(
+                                f'Found unsupported field {field!r}.')
+                err_msg += ' '.join(sub_msgs)
         else:
-            message = e.message
+            # When the error came from an anyOf/oneOf branch, jsonschema's
+            # default message is the unhelpful "X is not valid under any of
+            # the given schemas" with json_path truncated at the branch
+            # boundary. best_match recurses into the sub-error context for
+            # anyOf/oneOf nodes specifically (see its docstring) and
+            # surfaces the deepest, most-specific sub-error.
+            best = jsonschema.exceptions.best_match([e])
+            message = best.message
             # Object in jsonschema is represented as dict in Python. Replace
             # 'object' with 'dict' for better readability.
             message = message.replace('type \'object\'', 'type \'dict\'')
             # Example e.json_path value: '$.resources'
             err_msg = (err_msg_prefix + message +
-                       f'. Check problematic field(s): {e.json_path}')
+                       f'. Check problematic field(s): {best.json_path}')
 
     if err_msg:
         with ux_utils.print_exception_no_traceback():

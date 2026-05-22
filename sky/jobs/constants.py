@@ -2,8 +2,6 @@
 import os
 from typing import Any, Dict, Union
 
-from sky.skylet import constants as skylet_constants
-
 # Environment variable for JobGroup name, injected into all jobs in a JobGroup
 SKYPILOT_JOBGROUP_NAME_ENV_VAR = 'SKYPILOT_JOBGROUP_NAME'
 
@@ -25,8 +23,23 @@ SIGNAL_FILE_PREFIX = '/tmp/sky_jobs_controller_signal_{}'
 CONSOLIDATION_MODE_LOCK_ID = '~/.sky/consolidation_mode_lock'
 
 # Signal file indicating the API server has been restarted after enabling
+<<<<<<< HEAD
 # consolidation mode. Created by setup_consolidation_mode_on_startup() in
 # sky/jobs/utils.py.
+=======
+# consolidation mode. Written by setup_consolidation_mode_on_startup() in
+# sky/jobs/utils.py. It is the single source of truth for jobs-controller
+# consolidation state and is read via the helpers in
+# sky/utils/controller_utils.py:
+#   - is_jobs_consolidation_mode() — user-facing reader. Shared by both
+#     sky/jobs/utils.py::is_consolidation_mode() (managed jobs) and
+#     sky/serve/serve_utils.py::is_consolidation_mode(pool=True) (pools),
+#     which are thin wrappers. Pool and managed-jobs readers route through
+#     the same helper so they cannot diverge.
+#   - _is_consolidation_mode(pool=True) — sizing-only helper.
+# Reading config directly instead diverges under deploy-mode auto-enable
+# (config stays null while this file is written).
+>>>>>>> 565532c59288d5cfcd7dc58814aa93f7129f89ab
 JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE = (
     '~/.sky/.jobs_controller_consolidation_reloaded_signal')
 
@@ -64,6 +77,7 @@ JOBS_CLUSTER_NAME_PREFIX_LENGTH = 25
 # job.utils.ManagedJobCodeGen to handle the version update.
 # WARNING: If you update this due to a codegen change, make sure to make the
 # corresponding change in the ManagedJobsService AND bump the SKYLET_VERSION.
+<<<<<<< HEAD
 MANAGED_JOBS_VERSION = 16  # new fields for job graceful cancel
 
 # The command for setting up the jobs dashboard on the controller. It firstly
@@ -87,3 +101,6 @@ DASHBOARD_SETUP_CMD = (
     f'(nohup {skylet_constants.SKY_PYTHON_CMD} -m sky.jobs.dashboard.dashboard '
     '>> ~/.sky/job-dashboard.log 2>&1 &); '
     'fi')
+=======
+MANAGED_JOBS_VERSION = 19  # add cancel_managed_jobs dispatcher
+>>>>>>> 565532c59288d5cfcd7dc58814aa93f7129f89ab
