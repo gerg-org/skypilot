@@ -106,6 +106,8 @@ spec:
         {{- if .Values.gcpCredentials.enabled }}
         - name: GOOGLE_APPLICATION_CREDENTIALS
           value: /root/gcp-cred.json
+        - name: GOOGLE_CLOUD_PROJECT_ID
+          value: "{{ .Values.gcpCredentials.projectId }}"
         {{- end }}
         {{- if .Values.kubernetesCredentials.inclusterNamespace }}
         - name: SKYPILOT_IN_CLUSTER_NAMESPACE
@@ -555,10 +557,12 @@ spec:
         {{- end }}
         - name: GOOGLE_APPLICATION_CREDENTIALS
           value: /root/gcp-cred.json
+        - name: GOOGLE_CLOUD_PROJECT_ID
+          value: {{ .Values.gcpCredentials.projectId }}
         args:
         - |
           gcloud auth activate-service-account --key-file=/root/gcp-cred.json
-          gcloud config set project {{ .Values.gcpCredentials.projectId }}
+          gcloud config set project $GOOGLE_CLOUD_PROJECT_ID
         volumeMounts:
         - name: gcp-credentials
           mountPath: /root/gcp-cred.json

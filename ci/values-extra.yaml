@@ -14,14 +14,9 @@ apiService:
     pip uninstall -y vastai-sdk
     pip install "vastai-sdk<0.2.2"
 
-    # Install cudoctl, fix broken cudoctl api
-    echo "Installing cudoctl and fixing broken API"
-    curl https://download.cudocompute.com/cli/cudoctl_linux_amd64.tar.gz -o /tmp/cudoctl_linux_amd64.tar.gz
-    cd /tmp
-    tar --no-same-owner -xvf cudoctl_linux_amd64.tar.gz
-    mv cudoctl /usr/local/bin    
-    sed -i '1d' /usr/local/lib/python3.10/site-packages/cudo_compute/cudo_api.py
-
+    # re-setup gcp (can't access gcp api until Istio sidecar is running)
+    gcloud auth activate-service-account --key-file=/root/gcp-cred.json
+    gcloud config set project $GOOGLE_CLOUD_PROJECT_ID
 
   initialBasicAuthCredentials: "skypilot:$apr1$c1h4rNxt$2NnL7dIDUV0tWsnuNMGSr/"
   authUserHeaderName: X-authentik-email
@@ -226,7 +221,7 @@ paperspaceCredentials:
 
 # Populate Cudo credentials from the secret with key `api_key`
 cudoCredentials:
-  enabled: true
+  enabled: false
   # Name of the secret containing the RunPod credentials. Only used if enabled is true.
   cudoSecretName: cudo-credentials
 
