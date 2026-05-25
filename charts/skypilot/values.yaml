@@ -576,7 +576,7 @@ awsCredentials:
 
 
 gcpCredentials:
-  enabled: false
+  enabled: true
   # TODO(romilb): This can be made optional by using the project in the key json by default.
   # @schema type: [string, null]
   projectId: null
@@ -584,7 +584,7 @@ gcpCredentials:
   gcpSecretName: gcp-credentials
   # Docker image to use for initializing the GCP credentials.
   # @schema type: [string, null]
-  image: google/cloud-sdk:latest
+  image: registry.g3rg.org/gergorg/google-cloud-sdk:544.0.0-slim
 
 # Populate RunPod credentials from the secret with key `api_key`
 runpodCredentials:
