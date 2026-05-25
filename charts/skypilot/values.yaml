@@ -576,7 +576,7 @@ awsCredentials:
 
 
 gcpCredentials:
-  enabled: false
+  enabled: true
   # TODO(romilb): This can be made optional by using the project in the key json by default.
   # @schema type: [string, null]
   projectId: null
