@@ -579,7 +579,7 @@ gcpCredentials:
   enabled: true
   # TODO(romilb): This can be made optional by using the project in the key json by default.
   # @schema type: [string, null]
-  projectId: null
+  projectId: fundai-476020
   # Name of the secret containing the gcp credentials. Only used if enabled is true.
   gcpSecretName: gcp-credentials
   # Docker image to use for initializing the GCP credentials.
