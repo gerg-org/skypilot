@@ -557,7 +557,6 @@ spec:
         {{- end }}
         - name: GOOGLE_APPLICATION_CREDENTIALS
           value: /root/gcp-cred.json
-          subPath: gcp-cred.json
         - name: GOOGLE_CLOUD_PROJECT_ID
           value: "{{ .Values.gcpCredentials.projectId }}"
         args:
