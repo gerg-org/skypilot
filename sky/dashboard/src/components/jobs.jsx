@@ -3,9 +3,11 @@
  * @see https://v0.dev/t/X5tLGA3WPNU
  * Documentation: https://v0.dev/docs#integrating-generated-code-into-your-nextjs-app
  */
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useRouter } from 'next/router';
 import Link from 'next/link';
+import { PaginationControls } from '@/components/elements/PaginationControls';
+import { SegmentedToggle } from '@/components/elements/SegmentedToggle';
 import { CircularProgress } from '@mui/material';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -16,7 +18,15 @@ import {
   TableHead,
   TableBody,
   TableCell,
+  EmptyTableState,
 } from '@/components/ui/table';
+import { EmptyState } from '@/components/elements/EmptyState';
+import {
+  isForceEmpty,
+  getPersistedPageSize,
+  persistPageSize,
+} from '@/lib/utils';
+import { BriefcaseIcon } from '@/components/elements/icons';
 import {
   formatDuration,
   REFRESH_INTERVAL,
@@ -30,6 +40,7 @@ import jobsCacheManager from '@/lib/jobs-cache-manager';
 import { getClusters, downloadJobLogs } from '@/data/connectors/clusters';
 import { getWorkspaces } from '@/data/connectors/workspaces';
 import { getUsers } from '@/data/connectors/users';
+import { apiClient, getCurrentUserInfo } from '@/data/connectors/client';
 import {
   CustomTooltip as Tooltip,
   NonCapitalizedTooltip,
@@ -44,6 +55,9 @@ import {
   Download,
   ChevronDownIcon,
   ChevronRightIcon,
+  CheckIcon,
+  InfoIcon,
+  Layers,
 } from 'lucide-react';
 import {
   handleJobAction,
@@ -55,6 +69,11 @@ import { StatusBadge, getStatusStyle } from '@/components/elements/StatusBadge';
 import { PrimaryBadge } from '@/components/elements/PrimaryBadge';
 import { BatchBadge } from '@/components/elements/BatchBadge';
 import { UserDisplay } from '@/components/elements/UserDisplay';
+import {
+  TruncatedDetails,
+  ExpandedDetailsRow,
+  isDetailsToggle,
+} from '@/components/elements/TruncatedDetails';
 import { useMobile } from '@/hooks/useMobile';
 import dashboardCache from '@/lib/cache';
 import cachePreloader from '@/lib/cache-preloader';
@@ -63,16 +82,29 @@ import {
   useTableColumns,
   usePluginComponents,
   useMergedTableColumns,
+  usePluginTableFilters,
 } from '@/plugins/PluginProvider';
 import {
   FilterDropdown,
   Filters,
-  updateURLParams as sharedUpdateURLParams,
-  updateFiltersByURLParams as sharedUpdateFiltersByURLParams,
   buildFilterUrl,
   evaluateCondition,
 } from '@/components/shared/FilterSystem';
+import { useUrlFilterState } from '@/hooks/useUrlFilterState';
 import { trackJobAction, trackFilterUsed } from '@/lib/analytics';
+
+// Page-size ("rows per page") options for the managed jobs queue, and the
+// localStorage key used to remember the user's last choice across reloads.
+const JOBS_PAGE_SIZE_OPTIONS = [10, 30, 50, 100, 200];
+const JOBS_PAGE_SIZE_STORAGE_KEY = 'skypilot-jobs-page-size';
+
+// Same for the per-cluster jobs table and the pools table. Both keep their own
+// option lists (smaller tables, so smaller steps) and their own storage key, so
+// changing rows-per-page on one table never moves another.
+const CLUSTER_JOBS_PAGE_SIZE_OPTIONS = [5, 10, 20, 50];
+const CLUSTER_JOBS_PAGE_SIZE_STORAGE_KEY = 'skypilot-cluster-jobs-page-size';
+const POOLS_PAGE_SIZE_OPTIONS = [5, 10, 25, 50];
+const POOLS_PAGE_SIZE_STORAGE_KEY = 'skypilot-pools-page-size';
 
 // Define status groups for active and finished jobs
 export const statusGroups = {
@@ -94,6 +126,25 @@ export const statusGroups = {
     'FAILED_CONTROLLER',
   ],
 };
+
+// Statuses shown as primary chips on the Statuses filter bar.
+// Ordered along the typical job lifecycle (STARTING → RUNNING →
+// SUCCEEDED) so the bar reads left-to-right as a progress story.
+// FAILED and other terminal variants live in the "More" dropdown to
+// keep the summary line calm.
+const PRIMARY_STATUSES = ['STARTING', 'RUNNING', 'SUCCEEDED'];
+const OTHER_STATUSES = [
+  'PENDING',
+  'SUBMITTED',
+  'RECOVERING',
+  'CANCELLING',
+  'CANCELLED',
+  'FAILED',
+  'FAILED_SETUP',
+  'FAILED_PRECHECKS',
+  'FAILED_NO_RESOURCE',
+  'FAILED_CONTROLLER',
+];
 
 // Status priority for aggregation (higher index = worse status)
 const STATUS_PRIORITY = {
@@ -149,32 +200,96 @@ export function getAggregatedStatus(tasks) {
 }
 
 // Define filter options for the filter dropdown
-const PROPERTY_OPTIONS = [
-  {
-    label: 'ID',
-    value: 'id',
-  },
-  {
-    label: 'Name',
-    value: 'name',
-  },
-  {
-    label: 'User',
-    value: 'user',
-  },
-  {
-    label: 'Workspace',
-    value: 'workspace',
-  },
-  {
-    label: 'Pool',
-    value: 'pool',
-  },
-  {
-    label: 'Labels',
-    value: 'labels',
-  },
+// Name is first so it's the default when users open the dropdown —
+// users typically search by job name, not ID.
+// The filterable properties of this page, declared once: `key` is what the URL
+// carries, `label` is display only and is what a chip stores in
+// `filter.property`. The dropdown is derived from this list, so a property the
+// page offers is by construction one it can read back.
+export const JOB_FILTER_SCHEMA = [
+  { key: 'name', label: 'Name', kind: 'text' },
+  { key: 'id', label: 'ID', kind: 'text' },
+  { key: 'user', label: 'User', kind: 'text' },
+  { key: 'workspace', label: 'Workspace', kind: 'text' },
+  { key: 'pool', label: 'Pool', kind: 'text' },
+  { key: 'infra', label: 'Infra', kind: 'text' },
+  { key: 'labels', label: 'Labels', kind: 'kv', multi: 'repeat' },
 ];
+
+// Non-filter state that belongs in a shared link too.
+//
+// `status` is the single source of truth for which statuses the table shows,
+// and the pill bar plus the Active/All segments are two views of it:
+//   absent              -> every status ("All")
+//   'active'/'finished' -> that group, named rather than expanded so the link
+//                          stays short and keeps meaning the group
+//   'FAILED,CANCELLED'  -> exactly those, which is what clicking pills builds
+const JOB_VIEW_SCHEMA = [
+  { key: 'owner', default: 'mine' },
+  { key: 'status', default: '' },
+];
+
+// The `--infra` spec for a job row, i.e. what the Infra filter box has to be
+// submitted as.
+//
+// The box is parsed server-side by `InfraInfo.from_str`, so a suggestion has
+// to be in that syntax. The string the Infra column renders (`AWS
+// (us-east-1)`) is not: it parses to a cloud named `aws (us-east-1)`, which
+// matches no job, so offering it would hand back a filter that empties the
+// table. Mirrors `InfraInfo.to_str()` -- cloud lowercased, and the `ssh-`
+// prefix dropped from an SSH node pool's context, which `from_str` puts back.
+export function jobInfraSpec(job) {
+  const cloud = (job?.cloud || '').trim();
+  if (!cloud) {
+    return null;
+  }
+  const cloudSpec = cloud.toLowerCase();
+  let region = (job?.region || '').trim();
+  if (!region || region === '-') {
+    return cloudSpec;
+  }
+  if (cloudSpec === 'ssh' && region.startsWith('ssh-')) {
+    region = region.slice('ssh-'.length);
+  }
+  return `${cloudSpec}/${region}`;
+}
+
+const STATUS_GROUP_NAMES = Object.keys(statusGroups);
+
+const KNOWN_STATUSES = new Set([...PRIMARY_STATUSES, ...OTHER_STATUSES]);
+
+// Everything the status UI needs, derived from the single `status` param: a
+// group name, an explicit list of pills, or neither. Values we do not
+// recognise are dropped, the same way the filter decoders drop unknown
+// properties -- a hand-edited link must not leave the pill bar highlighting
+// a group that does not exist.
+export function deriveStatusView(statusParam) {
+  const value = statusParam || '';
+  const statusGroupName = STATUS_GROUP_NAMES.includes(value) ? value : null;
+  const selectedStatuses =
+    statusGroupName || !value
+      ? []
+      : value.split(',').filter((s) => KNOWN_STATUSES.has(s));
+  return {
+    statusGroupName,
+    selectedStatuses,
+    // Neither segment is highlighted while specific pills narrow the view.
+    activeTab: statusGroupName || (selectedStatuses.length > 0 ? null : 'all'),
+  };
+}
+
+// Properties that may hold several chips; the rest replace, so the page can
+// never show more filters than the URL is able to carry.
+const MULTI_VALUE_LABELS = new Set(
+  JOB_FILTER_SCHEMA.filter((e) => e.multi).map((e) => e.label)
+);
+
+const addFilter = (prevFilters, property, value) => {
+  const base = MULTI_VALUE_LABELS.has(property)
+    ? prevFilters.filter((f) => !(f.property === property && f.value === value))
+    : prevFilters.filter((f) => f.property !== property);
+  return [...base, { property, operator: ':', value }];
+};
 
 // Helper function to filter jobs by name
 export function filterJobsByName(jobs, nameFilter) {
@@ -253,12 +368,25 @@ export function ManagedJobs() {
   const jobsRefreshRef = React.useRef(null);
   const poolsRefreshRef = React.useRef(null);
   const [poolsData, setPoolsData] = useState([]);
-  const [filters, setFilters] = useState([]);
+  // Plugins may register extra filter properties for this table (e.g. the
+  // pagination plugin's Slurm Account/QOS filters) — registration is
+  // reactive, typically arriving with the plugin's first data response.
+  const pluginFilterProps = usePluginTableFilters('jobs');
+  const filterSchema = React.useMemo(
+    () => [...JOB_FILTER_SCHEMA, ...pluginFilterProps],
+    [pluginFilterProps]
+  );
+  // Filters and the shareable view state both live in the URL, keyed by name.
+  const { filters, setFilters, view, setView } = useUrlFilterState(
+    filterSchema,
+    JOB_VIEW_SCHEMA
+  );
   const [valueList, setValueList] = useState({
     name: [],
     user: [],
     workspace: [],
     pool: [],
+    infra: [],
     labels: [],
   });
   const [preloadingComplete, setPreloadingComplete] = useState(false);
@@ -329,37 +457,22 @@ export function ManagedJobs() {
     });
   };
 
-  // Helper function to update URL query parameters
-  const updateURLParams = (filters) => {
-    sharedUpdateURLParams(router, filters);
-  };
-
   // Track only the newly added filter (called from FilterDropdown callbacks)
   const trackNewFilter = (property, value) => {
     trackFilterUsed('job', { property, value });
   };
 
-  const updateFiltersByURLParams = React.useCallback(() => {
-    const propertyMap = new Map();
-    propertyMap.set('', '');
-    propertyMap.set('id', 'ID');
-    propertyMap.set('status', 'Status');
-    propertyMap.set('name', 'Name');
-    propertyMap.set('user', 'User');
-    propertyMap.set('workspace', 'Workspace');
-    propertyMap.set('pool', 'Pool');
-    propertyMap.set('labels', 'Labels');
-
-    const urlFilters = sharedUpdateFiltersByURLParams(router, propertyMap);
-    setFilters(urlFilters);
-  }, [router, setFilters]);
-
-  // Handle URL query parameters for tab selection and filters
-  useEffect(() => {
-    if (router.isReady) {
-      updateFiltersByURLParams();
-    }
-  }, [router.isReady, router.query.tab, updateFiltersByURLParams]);
+  // Clicking a user in the table adds (or replaces) a "User" filter rather
+  // than navigating to the users page. Replace-not-stack is intentional:
+  // two AND'd user filters would yield zero results.
+  const handleUserFilterClick = React.useCallback(
+    (username) => {
+      if (!username) return;
+      setFilters((prevFilters) => addFilter(prevFilters, 'User', username));
+      trackFilterUsed('job', { property: 'User', value: username });
+    },
+    [setFilters]
+  );
 
   return (
     <>
@@ -373,29 +486,37 @@ export function ManagedJobs() {
             Managed Jobs
           </Link>
         </div>
+        {/* Extension point for a small summary badge next to the page
+            title. Renders nothing when no plugin fills it. */}
+        <PluginSlot
+          name="jobs.header.badge"
+          wrapperClassName="flex items-center"
+        />
         <div className="w-full sm:w-auto max-w-xl">
           <FilterDropdown
-            propertyList={PROPERTY_OPTIONS}
+            propertyList={filterSchema.map(({ key, label }) => ({
+              label,
+              value: key,
+            }))}
             valueList={valueList}
             setFilters={setFilters}
-            updateURLParams={updateURLParams}
+            addFilter={addFilter}
             onFilterAdd={trackNewFilter}
             placeholder="Filter jobs"
           />
         </div>
       </div>
 
-      <Filters
-        filters={filters}
-        setFilters={setFilters}
-        updateURLParams={updateURLParams}
-      />
+      <Filters filters={filters} setFilters={setFilters} />
 
       <ManagedJobsTable
         refreshInterval={REFRESH_INTERVAL}
         setLoading={setLoading}
         refreshDataRef={jobsRefreshRef}
         filters={filters}
+        view={view}
+        setView={setView}
+        onUserFilter={handleUserFilterClick}
         onRefresh={handleRefresh}
         poolsData={poolsData}
         poolsLoading={poolsLoading}
@@ -412,6 +533,11 @@ export function ManagedJobs() {
           refreshDataRef={poolsRefreshRef}
         />
       </div>
+
+      {/* Extension point for jobs not managed by SkyPilot (e.g. foreign
+          Slurm jobs surfaced by the GPU Manager plugin). Renders nothing
+          when no plugin fills it. */}
+      <PluginSlot name="jobs.page.external-section" />
     </>
   );
 }
@@ -439,11 +565,61 @@ function BatchProgressBar({ completed, total }) {
   );
 }
 
+// External (non-managed) rows merged in by the server carry
+// is_external + external_cluster/external_job_id; their detail pages
+// live under /slurm-jobs instead of /jobs.
+function externalJobHref(item) {
+  return `/slurm-jobs/${encodeURIComponent(item.external_cluster)}/${encodeURIComponent(item.external_job_id)}`;
+}
+
+function ExternalPill() {
+  return (
+    <span
+      className="inline-flex items-center flex-shrink-0 ml-2 px-2 rounded-full border border-gray-200 bg-gray-100 text-gray-600 text-xs font-medium"
+      style={{ paddingTop: 1, paddingBottom: 1, lineHeight: 1.4 }}
+      title="This workload is launched and managed outside of SkyPilot"
+    >
+      External
+    </span>
+  );
+}
+
+// A Slurm job id lives in the CLUSTER's id space, not SkyPilot's — the raw
+// number can collide with a managed job id in the same column. Muted so the
+// two id spaces cannot be conflated; the tooltip names the owner.
+function ExternalJobId({ item, href }) {
+  return (
+    <NonCapitalizedTooltip
+      content={`External ID managed by Slurm cluster ${item.external_cluster}`}
+    >
+      <Link href={href} className="text-gray-400 underline decoration-dotted">
+        {item.external_job_id}
+      </Link>
+    </NonCapitalizedTooltip>
+  );
+}
+
+function JobNameLink({ href, name }) {
+  // max-w (not fixed w): the box shrinks to the name so a trailing badge
+  // sits next to the text instead of parking at the 240px edge after a
+  // short name; long names still truncate at 240px.
+  return (
+    <NonCapitalizedTooltip content={name}>
+      <Link href={href} className="text-blue-600 block max-w-[240px] truncate">
+        {name}
+      </Link>
+    </NonCapitalizedTooltip>
+  );
+}
+
 export function ManagedJobsTable({
   refreshInterval,
   setLoading,
   refreshDataRef,
   filters,
+  view,
+  setView,
+  onUserFilter,
   onRefresh,
   poolsData,
   poolsLoading,
@@ -452,23 +628,79 @@ export function ManagedJobsTable({
   lastFetchedTime,
 }) {
   const [sortConfig, setSortConfig] = useState({
-    key: null,
-    direction: 'ascending',
+    key: 'id',
+    direction: 'descending',
   });
+  // Plugin-registered filter properties (see ManagedJobs): their values are
+  // forwarded to the data provider verbatim as {property: key, value}.
+  const pluginFilterProps = usePluginTableFilters('jobs');
   const [loading, setLocalLoading] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
-  const [currentPage, setCurrentPage] = useState(1);
-  const [pageSize, setPageSize] = useState(10);
+  const [currentPage, setCurrentPage] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const p = parseInt(params.get('page'), 10);
+      return p > 0 ? p : 1;
+    }
+    return 1;
+  });
+  const [pageSize, setPageSize] = useState(() => {
+    if (typeof window !== 'undefined') {
+      // An explicit URL query param wins (e.g. a shared/bookmarked link);
+      // otherwise fall back to the last choice persisted in localStorage,
+      // and finally to the default of 10.
+      const params = new URLSearchParams(window.location.search);
+      const ps = parseInt(params.get('pageSize'), 10);
+      if (JOBS_PAGE_SIZE_OPTIONS.includes(ps)) {
+        return ps;
+      }
+      return getPersistedPageSize(
+        JOBS_PAGE_SIZE_STORAGE_KEY,
+        JOBS_PAGE_SIZE_OPTIONS,
+        10
+      );
+    }
+    return 10;
+  });
   const [expandedRowId, setExpandedRowId] = useState(null);
   const expandedRowRef = useRef(null);
   const [expandedJobGroups, setExpandedJobGroups] = useState(new Set());
-  const [selectedStatuses, setSelectedStatuses] = useState([]);
+  // `view.status` is the single source of truth; the pill bar and the
+  // Active/All segments are both views of it. A group name means the group.
+  const statusParam = view.status || '';
+  const { statusGroupName, selectedStatuses, activeTab } = React.useMemo(
+    () => deriveStatusView(statusParam),
+    [statusParam]
+  );
+  const setSelectedStatuses = React.useCallback(
+    (next) => setView('status', (next || []).join(',')),
+    [setView]
+  );
   const [statusCounts, setStatusCounts] = useState({});
+  // Per-cluster failures from the external (Slurm) jobs sweep; non-empty
+  // means external rows may be incomplete or stale. Dismissible warning.
+  const [externalFetchErrors, setExternalFetchErrors] = useState([]);
+  const [externalErrorsDismissed, setExternalErrorsDismissed] = useState('');
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const moreMenuRef = useRef(null);
   const [controllerStopped, setControllerStopped] = useState(false);
   const [controllerLaunching, setControllerLaunching] = useState(false);
   const [isRestarting, setIsRestarting] = useState(false);
-  const [activeTab, setActiveTab] = useState('all');
-  const [showAllMode, setShowAllMode] = useState(true);
+  // Default to scoping the table to the current user's jobs. Flips to
+  // 'all' when the user clicks the Everyone toggle, or implicitly when
+  // they pick a different user via the FilterDropdown (explicit user
+  // filter wins; see effectiveUserMatch in fetchData).
+  const userScope = view.owner || 'mine';
+  const setUserScope = React.useCallback(
+    (scope) => setView('owner', scope),
+    [setView]
+  );
+  const [currentUser, setCurrentUser] = useState(null);
+  // True once the /users/role lookup has resolved (with a real user, with
+  // the 'local'/anonymous sentinel, or by erroring out). Used to gate the
+  // initial fetch so we never make the expensive unscoped Everyone request
+  // ahead of the Mine narrow.
+  const [userResolved, setUserResolved] = useState(false);
   const [confirmationModal, setConfirmationModal] = useState({
     isOpen: false,
     title: '',
@@ -479,33 +711,50 @@ export function ManagedJobsTable({
   // Guards multiple concurrent fetches: only latest response should commit
   const requestSeqRef = useRef(0);
 
+  // Sync page/pageSize to URL query params.
+  // Use window.history.replaceState instead of router.replace to avoid
+  // triggering Next.js re-renders that cascade into filter resets.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const url = new URL(window.location.href);
+    if (currentPage > 1) {
+      url.searchParams.set('page', String(currentPage));
+    } else {
+      url.searchParams.delete('page');
+    }
+    if (pageSize !== 10) {
+      url.searchParams.set('pageSize', String(pageSize));
+    } else {
+      url.searchParams.delete('pageSize');
+    }
+    if (url.href !== window.location.href) {
+      // Keep the existing state: Next.js keeps its router entry there
+      // (`__N`, `key`, the resolved url), and nulling it makes a later
+      // popstate change the address bar without re-rendering the page.
+      window.history.replaceState(window.history.state, '', url.toString());
+    }
+  }, [currentPage, pageSize]);
+
   // Local state for jobs data (replacing useJobsData hook)
   const [data, setData] = useState([]);
+  // The Infra values the server computed across everything the other filters
+  // select. Empty when it did not send any (an older API server or jobs
+  // controller), and the page then falls back to the rows it has.
+  const [serverInfraOptions, setServerInfraOptions] = useState([]);
+  // Set when the jobs controller refused the infra filter because it is too
+  // old to apply it. The server errors rather than answering unfiltered, so
+  // there are no rows to show and the page has to say why.
+  const [infraFilterUnsupported, setInfraFilterUnsupported] = useState(null);
   const [totalCount, setTotalCount] = useState(0);
   const [totalNoFilter, setTotalNoFilter] = useState(0);
   const [hookControllerStopped, setHookControllerStopped] = useState(false);
 
-  // Compute statuses based on UI state for filtering
-  const computedStatuses = React.useMemo(() => {
-    // If specific statuses are selected, use those
-    if (selectedStatuses.length > 0) {
-      return selectedStatuses;
-    }
-    // If not in "show all" mode but no specific statuses selected, show no jobs
-    if (!showAllMode) {
-      return [];
-    }
-    // Show all active jobs
-    if (activeTab === 'active') {
-      return statusGroups.active;
-    }
-    // Show all finished jobs
-    if (activeTab === 'finished') {
-      return statusGroups.finished;
-    }
-    // For activeTab === 'all' and showAllMode === true, show all jobs
-    return [];
-  }, [selectedStatuses, showAllMode, activeTab]);
+  // An empty list means "every status", which is what the server treats a
+  // missing `statuses` param as.
+  const computedStatuses = React.useMemo(
+    () => (statusGroupName ? statusGroups[statusGroupName] : selectedStatuses),
+    [statusGroupName, selectedStatuses]
+  );
 
   // Convert sortConfig to API format
   const sortBy = React.useMemo(
@@ -580,13 +829,38 @@ export function ManagedJobsTable({
 
         // Build params for jobsCacheManager
         const jobIdFilter = getFilterValue('id');
+        // Explicit user picked via FilterDropdown wins over the Mine/Everyone
+        // toggle. Otherwise, scope to the current user when toggle is "mine".
+        // Send the username (not the id/hash): the server resolves
+        // `user_match` via `get_user_by_name_match` which does a LIKE on the
+        // `name` column. Passing the hash on multi-user tenants where id and
+        // name differ would silently return zero results.
+        const explicitUserMatch = getFilterValue('user');
+        const effectiveUserMatch =
+          explicitUserMatch !== undefined
+            ? explicitUserMatch
+            : userScope === 'mine' && currentUser
+              ? currentUser.name
+              : undefined;
         const params = {
           allUsers: true,
           jobIdMatch: jobIdFilter,
           nameMatch: getFilterValue('name'),
-          userMatch: getFilterValue('user'),
+          userMatch: effectiveUserMatch,
           workspaceMatch: getFilterValue('workspace'),
           poolMatch: getFilterValue('pool'),
+          // Matched server-side, against the cloud/region/zone columns on the
+          // job table, so `total`, the page count and the status counts all
+          // describe the filtered set.
+          infraMatch: getFilterValue('infra'),
+          // Values of plugin-registered filter properties, keyed by their
+          // schema key — the plugin's fetch function interprets them.
+          pluginFilters: pluginFilterProps
+            .map((f) => {
+              const value = getFilterValue(f.label.toLowerCase());
+              return value ? { property: f.key, value } : null;
+            })
+            .filter(Boolean),
           statuses: computedStatuses.length > 0 ? computedStatuses : undefined,
           page: currentPage,
           limit: pageSize,
@@ -605,16 +879,36 @@ export function ManagedJobsTable({
           if (response.controllerStopped) {
             setHookControllerStopped(true);
             setData([]);
+            setServerInfraOptions([]);
+            // The table is empty because the controller is down, not because a
+            // filter was refused. Leaving the refusal up would explain the
+            // empty table with a reason that no longer applies.
+            setInfraFilterUnsupported(null);
             setTotalCount(0);
             setTotalNoFilter(0);
             setStatusCounts({});
+            // No rows are shown, so a Slurm-sweep failure banner from a
+            // previous fetch would hang over an empty table.
+            setExternalFetchErrors([]);
           } else {
             setHookControllerStopped(false);
+            setInfraFilterUnsupported(null);
             setData(response.jobs || []);
+            setServerInfraOptions(response.infraOptions || []);
             setTotalCount(response.total || 0);
             setTotalNoFilter(response.totalNoFilter || response.total || 0);
             setStatusCounts(response.statusCounts || {});
+            setExternalFetchErrors(response.externalFetchErrors || []);
+            // Controller is reachable: clear any stale banner state from a
+            // previous fetch and skip the cluster-status lookup below.
+            setControllerStopped(false);
+            setControllerLaunching(false);
           }
+
+          // Render the table as soon as the queue data is in. Any optional
+          // controller-status banner is resolved below without blocking the
+          // table.
+          setIsInitialLoad(false);
 
           // Prefetch next page in background
           if (response.hasNext) {
@@ -622,8 +916,16 @@ export function ManagedJobsTable({
           }
         }
 
-        // Check controller status from clusters
-        if (includeStatus) {
+        // Check controller status from clusters — only needed when the
+        // queue response indicated the controller wasn't reachable. The
+        // queue endpoint catches ClusterNotUpError and returns
+        // controllerStopped=true for both STOPPED and INIT-without-head_ip
+        // (i.e. LAUNCHING). We then call /status to disambiguate so the
+        // right banner is shown. When the controller is reachable
+        // (controllerStopped === false) there is no banner to show, so we
+        // skip /status entirely — saving ~hundreds of ms on every page
+        // load and on every 5-second periodic refresh.
+        if (includeStatus && response.controllerStopped) {
           try {
             const clustersData = await dashboardCache.get(getClusters);
 
@@ -637,11 +939,7 @@ export function ManagedJobsTable({
               const jobControllerClusterStatus = jobControllerCluster
                 ? jobControllerCluster.status
                 : 'NOT_FOUND';
-              // Check both cluster status and API response
-              if (
-                jobControllerClusterStatus === 'STOPPED' &&
-                response.controllerStopped
-              ) {
+              if (jobControllerClusterStatus === 'STOPPED') {
                 isControllerStopped = true;
               }
               if (jobControllerClusterStatus === 'LAUNCHING') {
@@ -657,10 +955,6 @@ export function ManagedJobsTable({
             console.error('Error fetching clusters:', error);
           }
         }
-
-        if (version === requestSeqRef.current) {
-          setIsInitialLoad(false);
-        }
       } catch (err) {
         console.error('Error fetching data:', err);
         if (version === requestSeqRef.current) {
@@ -669,6 +963,10 @@ export function ManagedJobsTable({
           setTotalNoFilter(0);
           setStatusCounts({});
           setControllerStopped(false);
+          setExternalFetchErrors([]);
+          setInfraFilterUnsupported(
+            err?.infraFilterUnsupported ? err.message : null
+          );
           setIsInitialLoad(false);
         }
       } finally {
@@ -686,6 +984,9 @@ export function ManagedJobsTable({
       computedStatuses,
       sortBy,
       sortOrder,
+      userScope,
+      currentUser,
+      pluginFilterProps,
     ]
   );
 
@@ -709,13 +1010,35 @@ export function ManagedJobsTable({
   // only trigger on actual user interactions (page change, filter change, etc.)
   const isInitialFetch = React.useRef(true);
 
-  // Initial load - runs immediately on mount, don't wait for full preloading
-  // The preloader will warm the cache in background, but we fetch jobs data
-  // right away so the table displays as fast as possible
+  // Initial load - wait for the /users/role lookup to settle (real
+  // user, 'local' sentinel, or error) before firing the first jobs
+  // fetch. Going Mine-first matters on tenants with tens of thousands
+  // of finished jobs: the Everyone query is expensive (full count +
+  // status aggregation) and we'd pay it twice — once on the unscoped
+  // initial fetch, once on the narrow Mine refetch — if we didn't gate.
+  // With the shared cache warm this gate adds essentially zero latency;
+  // cold loads pay a single ~200ms /users/role wait.
   React.useEffect(() => {
+    if (!isInitialFetch.current) return;
+    if (!userResolved) return;
     fetchData({ includeStatus: true });
-    // Mark that initial fetch is complete so other effects can run
     isInitialFetch.current = false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userResolved]);
+
+  // Safety net: if /users/role somehow never resolves (network hang),
+  // fall back to the unscoped fetch so the page still renders. Almost
+  // never triggers in practice — getCurrentUserInfo() catches its own
+  // errors and resolves with the 'local' sentinel.
+  React.useEffect(() => {
+    if (!isInitialFetch.current) return undefined;
+    const t = setTimeout(() => {
+      if (isInitialFetch.current) {
+        setUserScope('all');
+        setUserResolved(true);
+      }
+    }, 3000);
+    return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -735,13 +1058,13 @@ export function ManagedJobsTable({
     }
   }, [filters, pageSize, fetchData, preloadingComplete]);
 
-  // Fetch on status filter changes (activeTab, selectedStatuses, showAllMode)
-  // Skip on initial fetch (these have default values)
+  // Fetch when the status selection changes.
+  // Skip on initial fetch (it has a default value)
   React.useEffect(() => {
     if (!isInitialFetch.current && preloadingComplete) {
       fetchData({ includeStatus: true });
     }
-  }, [activeTab, selectedStatuses, showAllMode, fetchData, preloadingComplete]);
+  }, [statusParam, fetchData, preloadingComplete]);
 
   // Fetch on sort config changes for server-side sorting
   // Skip on initial fetch (sortConfig has default value)
@@ -789,26 +1112,29 @@ export function ManagedJobsTable({
     };
   }, [effectiveRefreshInterval, hasRunningBatches, preloadingComplete]);
 
-  // Reset to first page when activeTab changes
+  // Reset to first page when activeTab, filters, pageSize, or sort changes.
+  // Guard with isInitialFetch so the page number read from the URL isn't
+  // overwritten during initialization (filter hydration from URL params
+  // triggers setFilters which would otherwise reset the page).
   useEffect(() => {
+    if (isInitialFetch.current) return;
     setCurrentPage(1);
-  }, [activeTab]);
+  }, [activeTab, filters, pageSize, sortConfig]);
 
-  // Reset to first page when filters or page size changes
-  useEffect(() => {
-    setCurrentPage(1);
-  }, [filters, pageSize]);
-
-  // Reset to first page when sort config changes
-  useEffect(() => {
-    setCurrentPage(1);
-  }, [sortConfig]);
-
-  // Reset status filter when activeTab changes
-  useEffect(() => {
-    setSelectedStatuses([]);
-    setShowAllMode(true); // Default to show all mode when changing tabs
-  }, [activeTab]);
+  // Switch ownership scope (My Jobs vs All Jobs). Resets status narrowing
+  // so a status chip selected in one scope (e.g. RUNNING in My Jobs)
+  // doesn't carry over and silently empty the table under the new scope.
+  // Leaves `activeTab` alone — Active/All is orthogonal to ownership.
+  const selectScope = React.useCallback(
+    (scope) => {
+      React.startTransition(() => {
+        setUserScope(scope);
+        setSelectedStatuses([]);
+        setCurrentPage(1);
+      });
+    },
+    [setUserScope, setSelectedStatuses]
+  );
 
   // Populate valueList for filter dropdown
   useEffect(() => {
@@ -820,6 +1146,7 @@ export function ManagedJobsTable({
     const users = new Set();
     const workspaces = new Set();
     const pools = new Set();
+    const infras = new Set();
     const labels = new Set();
 
     data.forEach((job) => {
@@ -827,6 +1154,11 @@ export function ManagedJobsTable({
       if (job.user) users.add(job.user);
       if (job.workspace) workspaces.add(job.workspace);
       if (job.pool) pools.add(job.pool);
+      // An `--infra` spec, not the rendered `infra` / `full_infra` cell:
+      // the box is matched server-side by `InfraInfo.from_str`, and a
+      // display string does not parse. See `jobInfraSpec`.
+      const infraSpec = jobInfraSpec(job);
+      if (infraSpec) infras.add(infraSpec);
 
       // Extract labels - add only key:value pairs
       const jobLabels = job.labels || {};
@@ -869,6 +1201,12 @@ export function ManagedJobsTable({
       user: Array.from(users).sort(),
       workspace: Array.from(workspaces).sort(),
       pool: Array.from(pools).sort(),
+      // The server's list covers the whole filtered queue; the page-derived
+      // one only covers the current page, and is the fallback for a server
+      // that does not send one.
+      infra: serverInfraOptions.length
+        ? [...serverInfraOptions].sort()
+        : Array.from(infras).sort(),
       labels: Array.from(labels).sort(),
     });
 
@@ -891,7 +1229,7 @@ export function ManagedJobsTable({
           : prev.workspace,
       }));
     });
-  }, [data, poolsData, setValueList]);
+  }, [data, poolsData, serverInfraOptions, setValueList]);
 
   const requestSort = React.useCallback(
     (key) => {
@@ -925,6 +1263,20 @@ export function ManagedJobsTable({
     ).length;
     return { active, finished };
   }, [data]);
+
+  // Non-primary statuses currently selected — surface them as inline chips
+  // alongside the More dropdown so active filters are always visible.
+  const nonPrimarySelectedStatuses = React.useMemo(
+    () => selectedStatuses.filter((s) => !PRIMARY_STATUSES.includes(s)),
+    [selectedStatuses]
+  );
+
+  // Total count of jobs across all "other" (More dropdown) statuses; surfaced
+  // on the dropdown pill so users see how many jobs the long tail covers.
+  const otherStatusesTotalCount = React.useMemo(
+    () => OTHER_STATUSES.reduce((sum, s) => sum + (statusCounts[s] ?? 0), 0),
+    [statusCounts]
+  );
 
   // Helper function to determine if a status should be highlighted
   const isStatusHighlighted = (status) => {
@@ -985,7 +1337,15 @@ export function ManagedJobsTable({
   const groupedJobs = React.useMemo(() => {
     const groups = new Map();
     paginatedData.forEach((job) => {
-      const jobId = job.id;
+      // External rows never form job groups; key them by their globally
+      // unique task_job_id so equal Slurm ids across clusters (or a
+      // Slurm id matching a managed id) can't collapse into one group.
+      // Fall back to a prefixed id if a producer ever omits task_job_id,
+      // so such rows degrade to per-id groups instead of one undefined
+      // group rendering as a bogus JobGroup.
+      const jobId = job.is_external
+        ? (job.task_job_id ?? `external:${job.id}`)
+        : job.id;
       if (!groups.has(jobId)) {
         groups.set(jobId, []);
       }
@@ -1073,31 +1433,118 @@ export function ManagedJobsTable({
   // Check if a job group is expanded
   const isJobGroupExpanded = (jobId) => expandedJobGroups.has(jobId);
 
-  // Handle status selection
-  const handleStatusClick = (status) => {
-    // Toggle the clicked status without affecting others
-    if (selectedStatuses.includes(status)) {
-      // If the status is already selected, unselect it
-      const newSelectedStatuses = selectedStatuses.filter((s) => s !== status);
-
-      if (newSelectedStatuses.length === 0) {
-        // When deselecting the last selected status, go back to "show all" mode
-        // for the current active tab (active/finished)
-        setShowAllMode(true);
-        setSelectedStatuses([]);
-      } else {
-        setSelectedStatuses(newSelectedStatuses);
-        // We're not in "show all" mode if there are specific statuses selected
-        setShowAllMode(false);
+  // Fetch the current user once so the Mine/Everyone toggle can scope
+  // results to the logged-in user. Routes through the shared
+  // getCurrentUserInfo() cache in client.js so we don't pay the
+  // /users/role round-trip more than once per page session (sidebar /
+  // config / etc. typically already populated the cache by the time we
+  // get here). The 'local' sentinel id means the caller is anonymous
+  // (no auth / basic-auth without a logged-in user) — there's no
+  // meaningful "Mine" view in that case, so flip to Everyone and hide
+  // the Mine/Everyone toggle so the dashboard works the way every
+  // unauthenticated tenant expects.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const info = await getCurrentUserInfo();
+        if (cancelled) return;
+        if (info && info.id && info.id !== 'local') {
+          setCurrentUser({ id: info.id, name: info.name || info.id });
+        } else {
+          setUserScope('all');
+        }
+      } catch (e) {
+        // Role endpoint unreachable — assume no usable identity and
+        // default to Everyone rather than leaving the page stuck.
+        if (!cancelled) setUserScope('all');
+      } finally {
+        if (!cancelled) setUserResolved(true);
       }
-    } else {
-      // Add the clicked status to the selected statuses
-      setSelectedStatuses([...selectedStatuses, status]);
-      // We're not in "show all" mode if there are specific statuses selected
-      setShowAllMode(false);
-    }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Runs once on mount; setUserScope is stable via useCallback.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-    // Reset to first page when changing status filters
+  // When the Mine view comes up empty, fire a one-shot probe for the
+  // Everyone total so the empty state can tell the user "you haven't
+  // submitted anything yet, but N jobs from others are out there —
+  // click to see them". Avoids leaving the user staring at a blank
+  // table wondering whether SkyPilot has any activity at all.
+  //
+  // We use the client-side rendered row count (data.length) as the
+  // empty signal rather than the server's totalNoFilter — totalNoFilter
+  // currently reflects the unfiltered (including-other-users) total and
+  // doesn't honor userMatch, so it would suppress this CTA for any
+  // installation where other users have jobs.
+  const [everyoneTotal, setEveryoneTotal] = useState(null);
+  useEffect(() => {
+    if (userScope !== 'mine') return;
+    if (!currentUser) return;
+    if (loading || isInitialLoad) return;
+    if (data.length > 0) return;
+    if (everyoneTotal !== null) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await jobsCacheManager.getPaginatedJobs({
+          allUsers: true,
+          page: 1,
+          limit: 1,
+        });
+        if (cancelled) return;
+        setEveryoneTotal(resp?.totalNoFilter ?? resp?.total ?? 0);
+      } catch (e) {
+        if (!cancelled) setEveryoneTotal(0);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    userScope,
+    currentUser,
+    loading,
+    isInitialLoad,
+    data.length,
+    everyoneTotal,
+  ]);
+
+  // After ~1s of a non-initial load, fade a spinner overlay onto the
+  // table so the user knows their toggle/filter click is in-flight.
+  // We delay so quick (sub-second) fetches don't flash a spinner.
+  const [showSlowSpinner, setShowSlowSpinner] = useState(false);
+  useEffect(() => {
+    if (!loading || isInitialLoad) {
+      setShowSlowSpinner(false);
+      return undefined;
+    }
+    const t = setTimeout(() => setShowSlowSpinner(true), 1000);
+    return () => clearTimeout(t);
+  }, [loading, isInitialLoad]);
+
+  // Close the "More" status menu when clicking outside of it.
+  useEffect(() => {
+    if (!moreMenuOpen) return undefined;
+    const onPointerDown = (e) => {
+      if (moreMenuRef.current && !moreMenuRef.current.contains(e.target)) {
+        setMoreMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [moreMenuOpen]);
+
+  // Toggle one status. Clicking a pill while a group is selected narrows to
+  // exactly that status; deselecting the last one returns to every status.
+  const handleStatusClick = (status) => {
+    const next = selectedStatuses.includes(status)
+      ? selectedStatuses.filter((s) => s !== status)
+      : [...selectedStatuses, status];
+    setSelectedStatuses(next);
     setCurrentPage(1);
   };
 
@@ -1115,6 +1562,8 @@ export function ManagedJobsTable({
   const handlePageSizeChange = (e) => {
     const newSize = parseInt(e.target.value, 10);
     setPageSize(newSize);
+    // Remember the choice so it sticks across reloads.
+    persistPageSize(JOBS_PAGE_SIZE_STORAGE_KEY, newSize);
     setCurrentPage(1); // Reset to first page when changing page size
   };
 
@@ -1178,20 +1627,28 @@ export function ManagedJobsTable({
             );
           }
 
-          // Single task
+          // Single task. A row may carry its own detail link; external
+          // rows without one derive it from their identity fields, and
+          // everything else links to the managed-job detail page.
+          const detailHref =
+            item.detail_href ||
+            (item.is_external ? externalJobHref(item) : `/jobs/${item.id}`);
+          const idLink = item.is_external ? (
+            <ExternalJobId item={item} href={detailHref} />
+          ) : (
+            <Link href={detailHref} className="text-blue-600">
+              {item.id}
+            </Link>
+          );
           return (
             <TableCell>
               {hasAnyJobGroups ? (
                 <div className="flex items-center">
                   <span className="w-6 mr-1" aria-hidden="true" />
-                  <Link href={`/jobs/${item.id}`} className="text-blue-600">
-                    {item.id}
-                  </Link>
+                  {idLink}
                 </div>
               ) : (
-                <Link href={`/jobs/${item.id}`} className="text-blue-600">
-                  {item.id}
-                </Link>
+                idLink
               )}
             </TableCell>
           );
@@ -1220,9 +1677,7 @@ export function ManagedJobsTable({
             return (
               <TableCell className="whitespace-nowrap">
                 <div className="flex items-center">
-                  <Link href={`/jobs/${jobId}`} className="text-blue-600">
-                    {item.name}
-                  </Link>
+                  <JobNameLink href={`/jobs/${jobId}`} name={item.name} />
                   {isBatch && <BatchBadge className="ml-2" />}
                   <button
                     onClick={() => toggleJobGroup(jobId)}
@@ -1257,13 +1712,16 @@ export function ManagedJobsTable({
             );
           }
 
-          // Single task
+          // Single task. Same link resolution as the ID column: a
+          // row-provided detail link wins, external rows derive theirs.
+          const detailHref =
+            item.detail_href ||
+            (item.is_external ? externalJobHref(item) : `/jobs/${item.id}`);
           return (
             <TableCell className="whitespace-nowrap">
               <div className="flex items-center">
-                <Link href={`/jobs/${item.id}`} className="text-blue-600">
-                  {item.name}
-                </Link>
+                <JobNameLink href={detailHref} name={item.name} />
+                {item.is_external && <ExternalPill />}
                 {isBatch && <BatchBadge className="ml-2" />}
               </div>
             </TableCell>
@@ -1283,7 +1741,11 @@ export function ManagedJobsTable({
         ),
         renderCell: (item) => (
           <TableCell>
-            <UserDisplay username={item.user} userHash={item.user_hash} />
+            <UserDisplay
+              username={item.user}
+              userHash={item.user_hash}
+              onUserClick={onUserFilter}
+            />
           </TableCell>
         ),
       },
@@ -1303,12 +1765,16 @@ export function ManagedJobsTable({
         renderCell: (item) =>
           shouldShowWorkspace ? (
             <TableCell>
-              <Link
-                href="/workspaces"
-                className="text-gray-700 hover:text-blue-600 hover:underline"
-              >
-                {item.workspace || 'default'}
-              </Link>
+              {item.is_external ? (
+                <span className="text-gray-400">—</span>
+              ) : (
+                <Link
+                  href="/workspaces"
+                  className="text-gray-700 hover:text-blue-600 hover:underline"
+                >
+                  {item.workspace || 'default'}
+                </Link>
+              )}
             </TableCell>
           ) : null,
       },
@@ -1483,7 +1949,7 @@ export function ManagedJobsTable({
             className="sortable whitespace-nowrap"
             onClick={() => requestSort('cluster')}
           >
-            Requested Resources{getSortDirection('cluster')}
+            Resources{getSortDirection('cluster')}
           </TableHead>
         ),
         renderCell: (item, ctx) => {
@@ -1586,9 +2052,14 @@ export function ManagedJobsTable({
             return <TableCell>-</TableCell>;
           }
 
-          // Use task_job_id for group children to avoid conflicts
+          // Use task_job_id for group children to avoid conflicts, and for
+          // external rows always: their raw id is the Slurm cluster's id
+          // space, so equal ids across clusters (or against a managed id)
+          // would co-expand on plain item.id.
           const rowId =
-            ctx?.renderMode === 'groupChild' ? item.task_job_id : item.id;
+            ctx?.renderMode === 'groupChild' || item.is_external
+              ? item.task_job_id
+              : item.id;
 
           return (
             <TableCell>
@@ -1612,6 +2083,23 @@ export function ManagedJobsTable({
         renderHeader: () => <TableHead>Logs</TableHead>,
         renderCell: (item, ctx) => {
           const { renderMode, jobId } = ctx || {};
+
+          if (item.is_external) {
+            // External Slurm rows: logs live on their detail page.
+            return (
+              <TableCell>
+                <div className="flex items-center space-x-2">
+                  <Link
+                    href={externalJobHref(item)}
+                    title="View logs"
+                    className="text-sky-blue hover:text-sky-blue-bright font-medium inline-flex items-center h-8"
+                  >
+                    <FileSearchIcon className="w-4 h-4" />
+                  </Link>
+                </div>
+              </TableCell>
+            );
+          }
 
           // For group parent, use jobId; otherwise use item.id
           const logJobId = renderMode === 'groupParent' ? jobId : item.id;
@@ -1637,6 +2125,7 @@ export function ManagedJobsTable({
       expandedRowId,
       poolsLoading,
       poolsData,
+      onUserFilter,
     ]
   );
 
@@ -1720,97 +2209,236 @@ export function ManagedJobsTable({
     <div className="relative">
       <div className="flex flex-col space-y-1 mb-1">
         {/* Combined Status Filter */}
-        <div className="flex items-center justify-between text-sm mb-1">
+        <div className="flex items-center justify-between text-sm mb-4">
           <div className="flex flex-wrap items-center min-w-0">
             <span className="mr-2 text-sm font-medium">Statuses:</span>
             <div className="flex flex-wrap gap-2 items-center">
               {!loading && totalNoFilter === 0 && !isInitialLoad && (
                 <span className="text-gray-500 mr-2">No jobs found</span>
               )}
-              {Object.entries(statusCounts).map(([status, count]) => (
-                <button
-                  key={status}
-                  onClick={() => handleStatusClick(status)}
-                  className={`px-3 py-0.5 rounded-full flex items-center space-x-2 ${
-                    isStatusHighlighted(status) ||
-                    selectedStatuses.includes(status)
-                      ? getBadgeStyle(status)
-                      : 'bg-gray-50 text-gray-600 hover:bg-gray-100'
-                  }`}
-                >
-                  <span>{status}</span>
-                  <span
-                    className={`text-xs ${isStatusHighlighted(status) || selectedStatuses.includes(status) ? 'bg-white/50' : 'bg-gray-200'} px-1.5 py-0.5 rounded`}
-                  >
-                    {count}
-                  </span>
-                </button>
-              ))}
-              {totalNoFilter > 0 && (
-                <div className="flex items-center ml-2 gap-2">
-                  <span className="text-gray-500">(</span>
+              {/* Primary statuses: always rendered in fixed order so the bar
+                  doesn't jitter when counts change. The count badge uses
+                  tabular-nums + a fixed min-width so the chip width stays
+                  stable as counts change between 1 and many digits. */}
+              {PRIMARY_STATUSES.map((status) => {
+                const count = statusCounts[status] ?? 0;
+                const highlighted =
+                  isStatusHighlighted(status) ||
+                  selectedStatuses.includes(status);
+                return (
                   <button
-                    onClick={() => {
-                      // When showing all jobs, clear all selected statuses
-                      // Use React.startTransition to batch state updates
-                      React.startTransition(() => {
-                        setActiveTab('all');
-                        setSelectedStatuses([]);
-                        setShowAllMode(true);
-                        setCurrentPage(1);
-                      });
-                    }}
-                    className={`text-sm font-medium ${
-                      activeTab === 'all' && showAllMode
-                        ? 'text-purple-700 underline'
-                        : 'text-gray-600 hover:text-purple-700 hover:underline'
+                    key={status}
+                    onClick={() => handleStatusClick(status)}
+                    className={`px-3 py-0.5 rounded-full flex items-center space-x-2 ${
+                      highlighted
+                        ? getBadgeStyle(status)
+                        : 'bg-gray-50 text-gray-600 hover:bg-gray-100'
                     }`}
                   >
-                    show all jobs
+                    <span>{status}</span>
+                    <span
+                      className={`text-xs tabular-nums text-center min-w-[1.5rem] ${highlighted ? 'bg-white/50' : 'bg-gray-200'} px-1.5 py-0.5 rounded`}
+                    >
+                      {count}
+                    </span>
                   </button>
-                  <span className="text-gray-500 mx-1">|</span>
+                );
+              })}
+              {/* Selected non-primary statuses surface as inline chips so the
+                  user can always see which filters are active without opening
+                  the dropdown. */}
+              {nonPrimarySelectedStatuses.map((status) => {
+                const count = statusCounts[status] ?? 0;
+                return (
                   <button
-                    onClick={() => {
-                      // When showing all active jobs, clear all selected statuses
-                      // Use React.startTransition to batch state updates
-                      React.startTransition(() => {
-                        setActiveTab('active');
-                        setSelectedStatuses([]);
-                        setShowAllMode(true);
-                        setCurrentPage(1);
-                      });
-                    }}
-                    className={`text-sm font-medium ${
-                      activeTab === 'active' && showAllMode
-                        ? 'text-green-700 underline'
-                        : 'text-gray-600 hover:text-green-700 hover:underline'
-                    }`}
+                    key={status}
+                    onClick={() => handleStatusClick(status)}
+                    className={`px-3 py-0.5 rounded-full flex items-center space-x-2 ${getBadgeStyle(status)}`}
                   >
-                    show all active jobs
+                    <span>{status}</span>
+                    <span className="text-xs tabular-nums text-center min-w-[1.5rem] bg-white/50 px-1.5 py-0.5 rounded">
+                      {count}
+                    </span>
                   </button>
-                  <span className="text-gray-500 mx-1">|</span>
-                  <button
-                    onClick={() => {
-                      // When showing all finished jobs, clear all selected statuses
-                      // Use React.startTransition to batch state updates
-                      React.startTransition(() => {
-                        setActiveTab('finished');
-                        setSelectedStatuses([]);
-                        setShowAllMode(true);
-                        setCurrentPage(1);
-                      });
-                    }}
-                    className={`text-sm font-medium ${
-                      activeTab === 'finished' && showAllMode
-                        ? 'text-blue-700 underline'
-                        : 'text-gray-600 hover:text-blue-700 hover:underline'
-                    }`}
+                );
+              })}
+              {/* More dropdown: holds the long tail of statuses
+                  (PENDING, STARTING, CANCELLED, FAILED_*, …). */}
+              {(() => {
+                // Count dropdown items currently included in the filter
+                // (either explicitly via selectedStatuses or implicitly
+                // because Active is selected). When the user is in any
+                // narrowed state, surface that count on the pill so the
+                // button itself signals filtering is active.
+                const otherIncludedCount = OTHER_STATUSES.filter((s) =>
+                  isStatusHighlighted(s)
+                ).length;
+                const otherTotalCount = otherStatusesTotalCount;
+                const isNarrowed =
+                  activeTab !== 'all' || selectedStatuses.length > 0;
+                return (
+                  <div className="relative" ref={moreMenuRef}>
+                    <button
+                      onClick={() => setMoreMenuOpen((v) => !v)}
+                      className={`px-3 py-0.5 rounded-full flex items-center space-x-1.5 ${
+                        isNarrowed
+                          ? 'bg-gray-200 text-gray-800'
+                          : 'bg-gray-50 text-gray-600 hover:bg-gray-100'
+                      }`}
+                      aria-haspopup="true"
+                      aria-expanded={moreMenuOpen}
+                    >
+                      <span>More</span>
+                      {isNarrowed ? (
+                        <span className="text-xs tabular-nums bg-white/70 px-1.5 py-0.5 rounded">
+                          <span className="inline-block text-center min-w-[1rem]">
+                            {otherIncludedCount}
+                          </span>{' '}
+                          selected
+                        </span>
+                      ) : (
+                        otherTotalCount > 0 && (
+                          <span className="text-xs tabular-nums text-center min-w-[1.5rem] inline-block bg-gray-200 px-1.5 py-0.5 rounded">
+                            {otherTotalCount}
+                          </span>
+                        )
+                      )}
+                      <ChevronDownIcon
+                        className={`w-3.5 h-3.5 transition-transform ${moreMenuOpen ? 'rotate-180' : ''}`}
+                      />
+                    </button>
+                    {moreMenuOpen && (
+                      <div className="absolute left-0 z-50 mt-1 w-60 rounded-md border border-gray-200 bg-white shadow-md py-1">
+                        {OTHER_STATUSES.map((status) => {
+                          const count = statusCounts[status] ?? 0;
+                          // A status is included in the current view either
+                          // explicitly (selectedStatuses) or implicitly via
+                          // the Active/All toggle (e.g. PENDING/STARTING are
+                          // implicitly included when Active is selected).
+                          // Both cases should light up the check + label.
+                          const included = isStatusHighlighted(status);
+                          const explicit = selectedStatuses.includes(status);
+                          return (
+                            <button
+                              key={status}
+                              onClick={() => handleStatusClick(status)}
+                              className={`w-full px-3 py-1.5 flex items-center justify-between text-sm hover:bg-gray-50 ${
+                                explicit ? 'bg-gray-50' : ''
+                              }`}
+                            >
+                              <span className="flex items-center gap-2 min-w-0">
+                                <CheckIcon
+                                  className={`w-3.5 h-3.5 shrink-0 ${included ? 'text-sky-blue' : 'text-transparent'}`}
+                                />
+                                <span
+                                  className={`truncate ${included ? 'font-medium text-gray-900' : count === 0 ? 'text-gray-400' : 'text-gray-700'}`}
+                                >
+                                  {status}
+                                </span>
+                              </span>
+                              <span
+                                className={`ml-2 text-xs tabular-nums text-right min-w-[2rem] ${count === 0 ? 'text-gray-400' : 'text-gray-500'}`}
+                              >
+                                {count}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+              {/* Activity toggle stays visible past the loading state.
+                  Hiding it on totalNoFilter===0 stranded users who'd
+                  narrowed Everyone with a filter that returned zero,
+                  or whose Mine view was empty — they had no easy way
+                  back. The toggle is harmless when the table is empty
+                  and indispensable as soon as anything else changes. */}
+              {(() => {
+                const selectTab = (tab) => {
+                  React.startTransition(() => {
+                    // 'all' is the default and stays out of the URL; a group
+                    // is named rather than expanded.
+                    setView('status', tab === 'all' ? '' : tab);
+                    setCurrentPage(1);
+                  });
+                };
+                // Neither segment is highlighted while specific pills narrow
+                // the view.
+                const activityValue = activeTab;
+                return (
+                  <SegmentedToggle
+                    ariaLabel="Filter jobs by activity"
+                    options={[
+                      { value: 'active', label: 'Active' },
+                      { value: 'all', label: 'All' },
+                    ]}
+                    value={activityValue}
+                    onChange={selectTab}
+                  />
+                );
+              })()}
+              {(() => {
+                if (!currentUser) return null;
+                const explicitUserFilter = (filters || []).find(
+                  (f) => (f.property || '').toLowerCase() === 'user' && f.value
+                );
+                const isMine = explicitUserFilter
+                  ? String(explicitUserFilter.value) === currentUser.id ||
+                    String(explicitUserFilter.value) === currentUser.name
+                  : userScope === 'mine';
+                const isEveryone = !explicitUserFilter && userScope === 'all';
+                return (
+                  <SegmentedToggle
+                    ariaLabel="Filter jobs by owner"
+                    options={[
+                      { value: 'mine', label: 'My Jobs' },
+                      { value: 'all', label: 'All Jobs' },
+                    ]}
+                    value={isMine ? 'mine' : isEveryone ? 'all' : null}
+                    onChange={selectScope}
+                  />
+                );
+              })()}
+              {/* Scope hint: when filtered to the current user's jobs,
+                  remind them and offer a one-click path to All Jobs.
+                  Sits at the tail of the chip + toggle row (same flex-wrap
+                  container) so it flows inline with the filter bar on
+                  wide screens and wraps below on narrow ones. Suppress
+                  in the empty state (the CTA already says this) and
+                  when an explicit user filter has overridden the toggle. */}
+              {(() => {
+                const explicitUserFilter = (filters || []).find(
+                  (f) => (f.property || '').toLowerCase() === 'user' && f.value
+                );
+                const showHint =
+                  userScope === 'mine' &&
+                  currentUser &&
+                  !explicitUserFilter &&
+                  !isInitialLoad &&
+                  paginatedData.length > 0;
+                if (!showHint) return null;
+                return (
+                  <div
+                    className="inline-flex items-center gap-2 rounded-full border border-sky-200/70 bg-sky-50 pl-2 pr-2.5 py-0.5 text-xs shrink-0"
+                    role="status"
+                    aria-live="polite"
                   >
-                    show all finished jobs
-                  </button>
-                  <span className="text-gray-500">)</span>
-                </div>
-              )}
+                    <InfoIcon className="h-3 w-3 text-sky-600 shrink-0" />
+                    <span className="text-gray-700">
+                      Showing your jobs only.
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => selectScope('all')}
+                      className="font-medium text-sky-700 transition-colors hover:text-sky-800 hover:underline"
+                    >
+                      View all jobs
+                    </button>
+                  </div>
+                );
+              })()}
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0 ml-2">
@@ -1839,6 +2467,44 @@ export function ManagedJobsTable({
           </div>
         </div>
       </div>
+
+      {/* Slurm sweep failures: external rows may be incomplete or stale.
+          Dismiss is keyed on the message text so a NEW failure re-surfaces
+          the warning while the same one stays dismissed. */}
+      {externalFetchErrors.length > 0 &&
+        (() => {
+          const errorText = externalFetchErrors
+            .map((f) => `${f.cluster}: ${f.error}`)
+            .join(' · ');
+          if (errorText === externalErrorsDismissed) return null;
+          return (
+            <div className="mb-3 flex items-start justify-between rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+              <div>
+                <div>
+                  Failed to fetch Slurm jobs from{' '}
+                  {externalFetchErrors.length === 1 ? 'cluster' : 'clusters'}{' '}
+                  {externalFetchErrors.map((f) => f.cluster).join(', ')} — their
+                  jobs may be missing or stale.
+                </div>
+                {externalFetchErrors.map((f) => (
+                  <div
+                    key={f.cluster}
+                    className="mt-1 font-mono text-xs text-amber-700"
+                  >
+                    {f.cluster}: {f.error}
+                  </div>
+                ))}
+              </div>
+              <button
+                onClick={() => setExternalErrorsDismissed(errorText)}
+                className="ml-3 flex-shrink-0 font-medium text-amber-800 hover:text-amber-900"
+                title="Dismiss"
+              >
+                ×
+              </button>
+            </div>
+          );
+        })()}
 
       {/* Mobile-specific controller stopped message outside table */}
       {isMobile &&
@@ -1876,8 +2542,22 @@ export function ManagedJobsTable({
           </div>
         )}
 
+      {infraFilterUnsupported && (
+        <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+          {infraFilterUnsupported}
+        </div>
+      )}
+
       <Card className="overflow-hidden">
-        <div className="overflow-x-auto">
+        <div className="overflow-x-auto relative">
+          {showSlowSpinner && (
+            <div
+              className="absolute inset-0 z-10 flex items-center justify-center bg-white/70 pointer-events-none transition-opacity"
+              aria-hidden="true"
+            >
+              <CircularProgress size={28} />
+            </div>
+          )}
           <Table className="min-w-full border-collapse">
             <TableHeader>
               <TableRow>
@@ -1887,7 +2567,18 @@ export function ManagedJobsTable({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {loading && isInitialLoad ? (
+              {(loading ||
+                (userScope === 'mine' &&
+                  currentUser &&
+                  everyoneTotal === null)) &&
+              paginatedData.length === 0 ? (
+                // Show the loading row both on initial fetch AND whenever
+                // a refetch starts with an empty table (e.g. right after
+                // clicking "View all jobs" or flipping the My Jobs/All
+                // Jobs toggle from a zero-row scope). Also covers the
+                // brief window between the empty Mine fetch returning
+                // and the Everyone probe answering, so the user doesn't
+                // flash through "No active jobs" before the CTA renders.
                 <TableRow>
                   <TableCell
                     colSpan={totalColSpan}
@@ -1899,7 +2590,7 @@ export function ManagedJobsTable({
                     </div>
                   </TableCell>
                 </TableRow>
-              ) : paginatedData.length > 0 ? (
+              ) : paginatedData.length > 0 && !isForceEmpty() ? (
                 <>
                   {Array.from(groupedJobs.entries()).map(([jobId, tasks]) => {
                     const isMultiTask = tasks.length > 1;
@@ -1999,12 +2690,12 @@ export function ManagedJobsTable({
                   })}
                 </>
               ) : (
-                <TableRow>
-                  <TableCell
-                    colSpan={totalColSpan}
-                    className="text-center py-6"
-                  >
-                    <div className="flex flex-col items-center space-y-4">
+                <TableRow className="hover:bg-transparent">
+                  <TableCell colSpan={totalColSpan} className="p-0">
+                    <div
+                      className="flex flex-col items-center justify-center space-y-4 px-6"
+                      style={{ minHeight: 280 }}
+                    >
                       {controllerLaunching && (
                         <div className="flex flex-col items-center space-y-2">
                           <p className="text-gray-700">
@@ -2017,9 +2708,53 @@ export function ManagedJobsTable({
                           </div>
                         </div>
                       )}
-                      {!controllerStopped && !controllerLaunching && (
-                        <p className="text-gray-500">No active jobs</p>
-                      )}
+                      {!controllerStopped &&
+                        !controllerLaunching &&
+                        (infraFilterUnsupported ? (
+                          <div className="flex flex-col items-center space-y-2 max-w-md text-center">
+                            <p className="text-gray-700">
+                              Cannot filter these jobs by infra.
+                            </p>
+                            <p className="text-sm text-gray-500">
+                              {infraFilterUnsupported}
+                            </p>
+                          </div>
+                        ) : userScope === 'mine' &&
+                          currentUser &&
+                          activeTab === 'all' &&
+                          everyoneTotal > 0 ? (
+                          <div className="flex flex-col items-center space-y-2 max-w-md">
+                            <p className="text-gray-700">
+                              You haven&apos;t submitted any managed jobs yet.
+                            </p>
+                            <p className="text-sm text-gray-500">
+                              {everyoneTotal.toLocaleString()} job
+                              {everyoneTotal === 1 ? '' : 's'} in total — switch
+                              to All Jobs to see them.
+                            </p>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => {
+                                React.startTransition(() => {
+                                  setUserScope('all');
+                                  setSelectedStatuses([]);
+                                  setCurrentPage(1);
+                                });
+                              }}
+                              className="text-sky-blue hover:text-sky-blue-bright"
+                            >
+                              View all jobs
+                            </Button>
+                          </div>
+                        ) : (
+                          <EmptyState
+                            icon={<BriefcaseIcon className="w-5 h-5" />}
+                            title="No active jobs"
+                            description="Launch a managed job to run it with automatic recovery"
+                            minHeight={0}
+                          />
+                        ))}
                       {/* Desktop controller stopped message stays in table */}
                       {!isMobile && controllerStopped && (
                         <div className="flex flex-col items-center space-y-3 px-4">
@@ -2057,100 +2792,30 @@ export function ManagedJobsTable({
         </div>
       </Card>
 
-      {/* Pagination controls - always show for visual separation */}
-      <div className="flex justify-end items-center py-2 px-4 text-sm text-gray-700">
-        <div className="flex items-center space-x-4">
-          <div className="flex items-center">
-            <span className="mr-2">Jobs per page:</span>
-            <div className="relative inline-block">
-              <select
-                value={pageSize}
-                onChange={handlePageSizeChange}
-                className="py-1 pl-2 pr-6 appearance-none outline-none cursor-pointer border-none bg-transparent"
-                style={{ minWidth: '40px' }}
-              >
-                <option value={10}>10</option>
-                <option value={30}>30</option>
-                <option value={50}>50</option>
-                <option value={100}>100</option>
-                <option value={200}>200</option>
-              </select>
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                className="h-4 w-4 text-gray-500 absolute right-0 top-1/2 transform -translate-y-1/2 pointer-events-none"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M19 9l-7 7-7-7"
-                />
-              </svg>
-            </div>
-          </div>
-          <div>
-            {totalCount > 0
-              ? `${startIndex + 1} – ${Math.min(startIndex + groupedJobs.size, totalCount)} of ${totalCount}`
-              : '0 – 0 of 0'}
-          </div>
-          <div className="flex items-center space-x-2">
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={goToPreviousPage}
-              disabled={
-                currentPage === 1 || !sortedData || sortedData.length === 0
-              }
-              className="text-gray-500 h-8 w-8 p-0"
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                className="chevron-left"
-              >
-                <path d="M15 18l-6-6 6-6" />
-              </svg>
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={goToNextPage}
-              disabled={
-                totalPages === 0 ||
-                currentPage >= totalPages ||
-                !sortedData ||
-                sortedData.length === 0
-              }
-              className="text-gray-500 h-8 w-8 p-0"
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                className="chevron-right"
-              >
-                <path d="M9 18l6-6-6-6" />
-              </svg>
-            </Button>
-          </div>
-        </div>
-      </div>
+      {/* Pagination controls */}
+      <PaginationControls
+        currentPage={currentPage}
+        totalPages={totalPages}
+        totalCount={totalCount}
+        startIndex={startIndex}
+        endIndex={startIndex + groupedJobs.size}
+        onPageChange={setCurrentPage}
+        onPreviousPage={goToPreviousPage}
+        onNextPage={goToNextPage}
+        isPrevDisabled={
+          currentPage === 1 || !sortedData || sortedData.length === 0
+        }
+        isNextDisabled={
+          totalPages === 0 ||
+          currentPage >= totalPages ||
+          !sortedData ||
+          sortedData.length === 0
+        }
+        pageSize={pageSize}
+        onPageSizeChange={handlePageSizeChange}
+        pageSizeOptions={JOBS_PAGE_SIZE_OPTIONS}
+        itemLabel="Jobs"
+      />
 
       <ConfirmationModal
         isOpen={confirmationModal.isOpen}
@@ -2263,7 +2928,15 @@ export function ClusterJobs({
     direction: 'ascending',
   });
   const [currentPage, setCurrentPage] = useState(1);
-  const [pageSize, setPageSize] = useState(10);
+  // Restore the last "rows per page" choice from localStorage so it survives
+  // reloads. Lazy initializer keeps the read out of the render path.
+  const [pageSize, setPageSize] = useState(() =>
+    getPersistedPageSize(
+      CLUSTER_JOBS_PAGE_SIZE_STORAGE_KEY,
+      CLUSTER_JOBS_PAGE_SIZE_OPTIONS,
+      10
+    )
+  );
   const expandedRowRef = useRef(null);
   const [prevClusterJobData, setPrevClusterJobData] = useState(null);
 
@@ -2272,7 +2945,8 @@ export function ClusterJobs({
       if (
         expandedRowId &&
         expandedRowRef.current &&
-        !expandedRowRef.current.contains(event.target)
+        !expandedRowRef.current.contains(event.target) &&
+        !isDetailsToggle(event.target)
       ) {
         setExpandedRowId(null);
       }
@@ -2355,6 +3029,8 @@ export function ClusterJobs({
     const newSize = parseInt(e.target.value, 10);
     setPageSize(newSize);
     setCurrentPage(1); // Reset to first page when changing page size
+    // Remember the choice so it sticks across reloads.
+    persistPageSize(CLUSTER_JOBS_PAGE_SIZE_STORAGE_KEY, newSize);
   };
 
   return (
@@ -2436,7 +3112,7 @@ export function ClusterJobs({
                   </div>
                 </TableCell>
               </TableRow>
-            ) : paginatedData.length > 0 ? (
+            ) : paginatedData.length > 0 && !isForceEmpty() ? (
               paginatedData.map((item) => (
                 <React.Fragment key={item.id}>
                   <TableRow
@@ -2496,161 +3172,33 @@ export function ClusterJobs({
                 </React.Fragment>
               ))
             ) : (
-              <TableRow>
-                <TableCell
-                  colSpan={8}
-                  className="text-center py-6 text-gray-500"
-                >
-                  No jobs found
-                </TableCell>
-              </TableRow>
+              <EmptyTableState
+                colSpan={8}
+                icon={<BriefcaseIcon className="w-5 h-5" />}
+                title="No jobs found"
+                description="Submit a job to run it on this cluster"
+              />
             )}
           </TableBody>
         </Table>
       </Card>
 
       {sortedData && sortedData.length > 0 && (
-        <div className="flex justify-end items-center py-2 px-4 text-sm text-gray-700">
-          <div className="flex items-center space-x-4">
-            <div className="flex items-center">
-              <span className="mr-2">Rows per page:</span>
-              <div className="relative inline-block">
-                <select
-                  value={pageSize}
-                  onChange={handlePageSizeChange}
-                  className="py-1 pl-2 pr-6 appearance-none outline-none cursor-pointer border-none bg-transparent"
-                  style={{ minWidth: '40px' }}
-                >
-                  <option value={5}>5</option>
-                  <option value={10}>10</option>
-                  <option value={20}>20</option>
-                  <option value={50}>50</option>
-                </select>
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  className="h-4 w-4 text-gray-500 absolute right-0 top-1/2 transform -translate-y-1/2 pointer-events-none"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M19 9l-7 7-7-7"
-                  />
-                </svg>
-              </div>
-            </div>
-            <div>
-              {startIndex + 1} – {Math.min(endIndex, sortedData.length)} of{' '}
-              {sortedData.length}
-            </div>
-            <div className="flex items-center space-x-2">
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={goToPreviousPage}
-                disabled={currentPage === 1}
-                className="text-gray-500 h-8 w-8 p-0"
-              >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  className="chevron-left"
-                >
-                  <path d="M15 18l-6-6 6-6" />
-                </svg>
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={goToNextPage}
-                disabled={currentPage === totalPages || totalPages === 0}
-                className="text-gray-500 h-8 w-8 p-0"
-              >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  className="chevron-right"
-                >
-                  <path d="M9 18l6-6-6-6" />
-                </svg>
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ExpandedDetailsRow({ text, colSpan, innerRef }) {
-  return (
-    <TableRow className="expanded-details">
-      <TableCell colSpan={colSpan}>
-        <div
-          className="p-4 bg-gray-50 rounded-md border border-gray-200"
-          ref={innerRef}
-        >
-          <div className="flex justify-between items-start">
-            <div className="flex-1">
-              <p className="text-sm font-medium text-gray-900">Full Details</p>
-              <p
-                className="mt-1 text-sm text-gray-700"
-                style={{ whiteSpace: 'pre-wrap' }}
-              >
-                {text}
-              </p>
-            </div>
-          </div>
-        </div>
-      </TableCell>
-    </TableRow>
-  );
-}
-
-function TruncatedDetails({ text, rowId, expandedRowId, setExpandedRowId }) {
-  const safeText = text || '';
-  const isTruncated = safeText.length > 50;
-  const isExpanded = expandedRowId === rowId;
-  // Always show truncated text in the table cell
-  const displayText = isTruncated ? `${safeText.substring(0, 50)}` : safeText;
-  const buttonRef = useRef(null);
-
-  const handleClick = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setExpandedRowId(isExpanded ? null : rowId);
-  };
-
-  return (
-    <div className="truncated-details relative max-w-full flex items-center">
-      <span className="truncate">{displayText}</span>
-      {isTruncated && (
-        <button
-          ref={buttonRef}
-          type="button"
-          onClick={handleClick}
-          className="text-blue-600 hover:text-blue-800 font-medium ml-1 flex-shrink-0"
-          data-button-type="show-more-less"
-        >
-          {isExpanded ? '... show less' : '... show more'}
-        </button>
+        <PaginationControls
+          currentPage={currentPage}
+          totalPages={totalPages}
+          totalCount={sortedData.length}
+          startIndex={startIndex}
+          endIndex={endIndex}
+          onPageChange={setCurrentPage}
+          onPreviousPage={goToPreviousPage}
+          onNextPage={goToNextPage}
+          isPrevDisabled={currentPage === 1}
+          isNextDisabled={currentPage === totalPages || totalPages === 0}
+          pageSize={pageSize}
+          onPageSizeChange={handlePageSizeChange}
+          pageSizeOptions={CLUSTER_JOBS_PAGE_SIZE_OPTIONS}
+        />
       )}
     </div>
   );
@@ -2665,7 +3213,15 @@ function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
   const [loading, setLocalLoading] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [currentPage, setCurrentPage] = useState(1);
-  const [pageSize, setPageSize] = useState(10);
+  // Restore the last "rows per page" choice from localStorage so it survives
+  // reloads. Lazy initializer keeps the read out of the render path.
+  const [pageSize, setPageSize] = useState(() =>
+    getPersistedPageSize(
+      POOLS_PAGE_SIZE_STORAGE_KEY,
+      POOLS_PAGE_SIZE_OPTIONS,
+      10
+    )
+  );
 
   const fetchData = React.useCallback(async () => {
     setLocalLoading(true);
@@ -2759,6 +3315,8 @@ function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
     const newSize = parseInt(e.target.value, 10);
     setPageSize(newSize);
     setCurrentPage(1);
+    // Remember the choice so it sticks across reloads.
+    persistPageSize(POOLS_PAGE_SIZE_STORAGE_KEY, newSize);
   };
 
   const getWorkersCount = (pool) => {
@@ -2784,6 +3342,10 @@ function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
   const InfraBadges = ({ replicaInfo }) => {
     return <SharedInfraBadges replicaInfo={replicaInfo} />;
   };
+
+  // Number of columns in the pools table header (Pool, Jobs, Workers,
+  // Worker Details, Worker Resources) — used for the empty-state colSpan.
+  const poolColumnCount = 5;
 
   return (
     <Card>
@@ -2831,7 +3393,7 @@ function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
                   </div>
                 </TableCell>
               </TableRow>
-            ) : paginatedData.length > 0 ? (
+            ) : paginatedData.length > 0 && !isForceEmpty() ? (
               paginatedData.map((pool) => (
                 <TableRow key={pool.name}>
                   <TableCell>
@@ -2861,56 +3423,36 @@ function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
                 </TableRow>
               ))
             ) : (
-              <TableRow>
-                <TableCell
-                  colSpan={5}
-                  className="text-center py-6 text-gray-500"
-                >
-                  No pools found
-                </TableCell>
-              </TableRow>
+              <EmptyTableState
+                colSpan={poolColumnCount}
+                icon={<Layers size={20} strokeWidth={1.75} />}
+                title="No pools found"
+                description="Create a pool to share workers across jobs"
+              />
             )}
           </TableBody>
         </Table>
       </div>
 
-      {/* Pagination */}
-      {paginatedData.length > 0 && totalPages > 1 && (
-        <div className="flex items-center justify-between px-4 py-3 border-t border-gray-200">
-          <div className="flex items-center space-x-2">
-            <span className="text-sm text-gray-700">Rows per page:</span>
-            <select
-              value={pageSize}
-              onChange={handlePageSizeChange}
-              className="border border-gray-300 rounded px-2 py-1 text-sm"
-            >
-              <option value={5}>5</option>
-              <option value={10}>10</option>
-              <option value={25}>25</option>
-              <option value={50}>50</option>
-            </select>
-          </div>
-          <div className="flex items-center space-x-2">
-            <span className="text-sm text-gray-700">
-              {startIndex + 1}-{Math.min(endIndex, sortedData.length)} of{' '}
-              {sortedData.length}
-            </span>
-            <button
-              onClick={goToPreviousPage}
-              disabled={currentPage === 1}
-              className="px-2 py-1 text-sm border border-gray-300 rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50"
-            >
-              Previous
-            </button>
-            <button
-              onClick={goToNextPage}
-              disabled={currentPage === totalPages}
-              className="px-2 py-1 text-sm border border-gray-300 rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50"
-            >
-              Next
-            </button>
-          </div>
-        </div>
+      {/* Pagination. Shown whenever there is at least one row — matching the
+          other tables — so the rows-per-page selector stays reachable even when
+          everything fits on a single page. */}
+      {paginatedData.length > 0 && (
+        <PaginationControls
+          currentPage={currentPage}
+          totalPages={totalPages}
+          totalCount={sortedData.length}
+          startIndex={startIndex}
+          endIndex={endIndex}
+          onPageChange={setCurrentPage}
+          onPreviousPage={goToPreviousPage}
+          onNextPage={goToNextPage}
+          isPrevDisabled={currentPage === 1}
+          isNextDisabled={currentPage === totalPages}
+          pageSize={pageSize}
+          onPageSizeChange={handlePageSizeChange}
+          pageSizeOptions={POOLS_PAGE_SIZE_OPTIONS}
+        />
       )}
     </Card>
   );

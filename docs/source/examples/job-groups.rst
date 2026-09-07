@@ -1,24 +1,18 @@
 .. _job-groups:
 
-Job Groups
-==========
-
-.. warning::
-
-  **This is an experimental feature.** The interface may change in future versions.
+Job Groups for RL
+=================
 
 Job Groups allow you to run multiple related tasks in parallel as a single managed unit.
 Unlike :ref:`managed jobs <managed-jobs>` which run tasks sequentially (pipelines),
 Job Groups launch all tasks simultaneously, enabling complex distributed architectures.
 
-.. figure:: ../images/job-groups-dashboard.png
+.. figure:: ../images/job-groups-rl-architecture.svg
    :width: 100%
    :align: center
-   :alt: Job Groups in SkyPilot Dashboard
+   :alt: SkyPilot Job Group: five tasks running in parallel for RL post-training — rollout-server and ppo-trainer on GPU; data-server, reward-server, and replay-buffer on CPU. Samples flow rollout → reward → buffer → trainer; policy weights loop back to rollout every step.
 
-   A Job Group with 4 tasks (data-server, rollout-server, reward-server, ppo-trainer)
-   running in parallel on Kubernetes. Each task has different resource requirements
-   and can be monitored independently through the dashboard.
+   A **SkyPilot Job Group** for RL post-training. Five heterogeneous tasks run side by side: samples flow rollout → reward → buffer → trainer, and new policy weights loop back to the rollout server every step.
 
 Overview
 --------
@@ -113,6 +107,19 @@ The header document supports the following fields:
        allowing them to finish pending work (e.g., flushing data). Can be a
        string (e.g., ``"30s"``, ``"5m"``) or a dict with per-task delays
        (e.g., ``{"default": "30s", "replay-buffer": "1m"}``).
+   * - ``inter_connection``
+     - ``None``
+     - Whether tasks need to reach each other by hostname.
+       ``true``: place all tasks on a single Kubernetes cluster and set
+       up hostname connectivity between them; hard-fail if either is not
+       possible. ``false``: deliberately skip all networking setup; tasks
+       still prefer co-location but may land on separate clusters.
+       Unset (default): assumes ``true`` — co-locate all tasks on a
+       single Kubernetes cluster and set up networking, unless the tasks
+       request non-Kubernetes infrastructure or pin infrastructures that
+       cannot be co-located, in which case it degrades to ``false`` with
+       a warning and skips networking setup.
+       See :ref:`job-groups-inter-connection`.
 
 Each task document after the header follows the standard :ref:`SkyPilot task YAML format <yaml-spec>`.
 
@@ -169,6 +176,52 @@ Example usage in a task:
     # Access the trainer task from the evaluator using the hostname
     curl http://trainer-0.${SKYPILOT_JOBGROUP_NAME}:8000/status
 
+.. _job-groups-inter-connection:
+
+Requiring or skipping in-group networking
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In-group service discovery is supported on Kubernetes. By default,
+in-group networking is enabled: SkyPilot places all tasks in a job group
+on a single Kubernetes cluster, and tasks wait for peer hostnames to
+become resolvable before running. If networking cannot be initialized,
+the job fails with a clear error rather than running without
+connectivity.
+
+Explicitly setting ``inter_connection: true`` is stricter than leaving it
+unset: placements where in-group networking cannot exist (non-Kubernetes
+infra, or infra pins with no common option) are rejected with an error,
+whereas with the field unset such placements proceed without networking
+and emit a warning.
+
+Set ``inter_connection: false`` in the header for tasks that do not need to
+reach each other by hostname (e.g., components that coordinate through an
+external endpoint or a shared object store):
+
+.. code-block:: yaml
+
+    name: my-job-group
+    execution: parallel
+    inter_connection: false
+    ---
+    # ... task documents ...
+
+With ``inter_connection: false``:
+
+- No in-group networking is set up, and tasks start immediately without
+  waiting for peers.
+- Tasks may be placed on **different Kubernetes clusters** when no single
+  cluster can host the whole group (e.g., the required GPU types live in
+  different clusters), or on non-Kubernetes infrastructure.
+- Tasks can also pin different clusters explicitly, via per-task
+  ``infra: k8s/<context>``.
+
+.. note::
+
+   Hostname-based service discovery across clusters is not yet
+   supported: tasks placed on different clusters cannot reach each other
+   via in-group hostnames.
+
 
 Viewing logs
 ------------
@@ -203,7 +256,7 @@ Parallel train-eval with shared storage
 This example runs training and evaluation in parallel, sharing checkpoints via
 a Kubernetes PVC volume:
 
-.. figure:: ../images/job-groups-train-eval-architecture.png
+.. figure:: ../images/job-groups-train-eval-architecture.svg
    :width: 80%
    :align: center
    :alt: Parallel Train-Eval Architecture with Job Groups
@@ -233,12 +286,12 @@ a Kubernetes PVC volume:
     run: |
       python evaluate.py --checkpoint-dir /checkpoints
 
-See the full example at ``llm/train-eval-jobgroup/`` in the SkyPilot repository.
+See the `full example <https://github.com/skypilot-org/skypilot/tree/master/llm/train-eval-jobgroup>`_ in the SkyPilot repository.
 
 RL post-training architecture
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-This example demonstrates a distributed RL post-training architecture with 5 tasks:
+This example demonstrates a distributed RL post-training architecture with 5 tasks (see the hero diagram at the top of the page). The trainer and rollout-server share a ``ReadWriteMany`` Kubernetes volume so the trainer can push freshly-updated policy weights back to the rollout-server every N steps, closing the RL feedback loop:
 
 .. code-block:: yaml
 
@@ -256,6 +309,8 @@ This example demonstrates a distributed RL post-training architecture with 5 tas
     num_nodes: 2
     resources:
       accelerators: A100:1
+    volumes:
+      /shared/policy: rlhf-policy
     run: |
       python rollout_server.py
     ---
@@ -276,13 +331,24 @@ This example demonstrates a distributed RL post-training architecture with 5 tas
     num_nodes: 2
     resources:
       accelerators: A100:1
+    volumes:
+      /shared/policy: rlhf-policy
     run: |
       python ppo_trainer.py \
         --data-server data-server-0.${SKYPILOT_JOBGROUP_NAME}:8000 \
         --rollout-server rollout-server-0.${SKYPILOT_JOBGROUP_NAME}:8001 \
-        --reward-server reward-server-0.${SKYPILOT_JOBGROUP_NAME}:8002
+        --reward-server reward-server-0.${SKYPILOT_JOBGROUP_NAME}:8002 \
+        --policy-sync-path /shared/policy/latest
 
-See the full RL post-training example at ``llm/rl-post-training-jobgroup/`` in the SkyPilot repository.
+.. figure:: ../images/job-groups-dashboard.png
+   :width: 100%
+   :align: center
+   :alt: Job Groups in SkyPilot Dashboard
+
+   The same Job Group running in production, viewed from the SkyPilot dashboard.
+   Each task has independent resources and can be monitored separately.
+
+See the `full RL post-training example <https://github.com/skypilot-org/skypilot/tree/master/llm/rl-post-training-jobgroup>`_ in the SkyPilot repository.
 
 Primary and auxiliary tasks
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~

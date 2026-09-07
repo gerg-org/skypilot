@@ -8,11 +8,90 @@ from unittest.mock import patch
 
 import pytest
 
+from sky import clouds
+from sky import exceptions
 from sky import resources
 from sky import task
+from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.backends.cloud_vm_ray_backend import CloudVmRayResourceHandle
 from sky.backends.cloud_vm_ray_backend import SSHTunnelInfo
+from sky.utils import locks
+from sky.utils import status_lib
+
+
+def test_command_length_local_shell_limit():
+    # The local-shell check, still used by generated code that runs on the
+    # cluster. Per-transport limits live on CommandRunner instead; see
+    # tests/unit_tests/test_sky/utils/test_command_runner.py.
+    command = "a'b" * 5000
+    assert not backend_utils.is_command_length_over_limit(command)
+    assert backend_utils.is_command_length_over_limit(command, quote_levels=4)
+
+
+def test_non_slurm_cpu_demand_uses_ray_default():
+    handle = MagicMock()
+    handle.launched_resources = resources.Resources(cloud=clouds.Kubernetes())
+    test_task = task.Task(resources=resources.Resources(cpus=1.5))
+
+    demands = (cloud_vm_ray_backend.CloudVmRayBackend._get_task_demands_dict(
+        handle, test_task))
+
+    assert demands['CPU'] == backend_utils.DEFAULT_TASK_CPU_DEMAND
+
+
+def test_slurm_controller_cpu_demand_uses_controller_default():
+    handle = MagicMock()
+    handle.launched_resources = resources.Resources(cloud=clouds.Slurm())
+    test_task = task.Task(resources=resources.Resources(cpus=4))
+    test_task.service_name = 'service'
+
+    demands = (cloud_vm_ray_backend.CloudVmRayBackend._get_task_demands_dict(
+        handle, test_task))
+
+    assert (
+        demands['CPU'] == backend_utils.constants.CONTROLLER_PROCESS_CPU_DEMAND)
+
+
+def test_slurm_cpu_demand_uses_allocated_cpus():
+    allocated = resources.Resources(cloud=clouds.Slurm(),
+                                    instance_type='2CPU--2GB')
+    handle = MagicMock()
+    handle.launched_resources = allocated
+    test_task = task.Task(resources=resources.Resources(cpus=0.25))
+    test_task.best_resources = allocated
+
+    demands = (cloud_vm_ray_backend.CloudVmRayBackend._get_task_demands_dict(
+        handle, test_task))
+
+    assert demands['CPU'] == 2.0
+
+
+def test_slurm_gpu_cpu_demand_uses_allocated_cpus():
+    allocated = resources.Resources(cloud=clouds.Slurm(),
+                                    instance_type='4CPU--16GB--H200:1')
+    handle = MagicMock()
+    handle.launched_resources = allocated
+    test_task = task.Task(resources=resources.Resources(
+        accelerators={'H200': 1}))
+    test_task.best_resources = allocated
+
+    demands = (cloud_vm_ray_backend.CloudVmRayBackend._get_task_demands_dict(
+        handle, test_task))
+
+    assert demands['CPU'] == 4.0
+
+
+def test_slurm_exec_cpu_demand_uses_cluster_allocation():
+    handle = MagicMock()
+    handle.launched_resources = resources.Resources(cloud=clouds.Slurm(),
+                                                    instance_type='8CPU--32GB')
+    test_task = task.Task(resources=resources.Resources())
+
+    demands = (cloud_vm_ray_backend.CloudVmRayBackend._get_task_demands_dict(
+        handle, test_task))
+
+    assert demands['CPU'] == 8.0
 
 
 class TestCloudVmRayBackendTaskRedaction:
@@ -470,6 +549,13 @@ class TestIsMessageTooLong:
             (1,
              'error: unable to upgrade connection: <html><body><h1>400 Bad request</h1>',
              True),
+            # Signatures are matched as bare substrings against the whole
+            # setup log, which is user output, so generic network-failure text
+            # must not be in the table: a user script printing it and exiting 1
+            # would have its setup re-run from the top.
+            (1, 'read tcp 10.0.0.1:443: connection reset by peer', False),
+            (1, 'gzip: unexpected EOF', False),
+            (1, 'Error from server: ', False),
             # Case insensitivity
             (255, 'TOO LONG', True),
             (1, 'REQUEST HEADER FIELDS TOO LARGE', True),
@@ -543,3 +629,246 @@ class TestIsMessageTooLong:
         mixed = "too long and request-uri too large"
         assert cloud_vm_ray_backend._is_message_too_long(255, output=mixed)
         assert cloud_vm_ray_backend._is_message_too_long(1, output=mixed)
+
+
+class TestCloudVmRayBackendTeardownNoLock:
+    """Tests for CloudVmRayBackend.teardown_no_lock() guards."""
+
+    @staticmethod
+    def _make_handle(cluster_name: str, cluster_yaml: str, has_ray: bool):
+
+        class _FakeLaunchedResources:
+
+            def __init__(self, cloud_obj):
+                self.cloud = cloud_obj
+
+            def assert_launchable(self):
+                return self
+
+        cloud = MagicMock()
+        cloud.PROVISIONER_VERSION = (
+            cloud_vm_ray_backend.clouds.ProvisionerVersion.SKYPILOT)
+        launched_resources = _FakeLaunchedResources(cloud)
+
+        handle = CloudVmRayResourceHandle(
+            cluster_name=cluster_name,
+            cluster_name_on_cloud=f'{cluster_name}-on-cloud',
+            cluster_yaml=cluster_yaml,
+            launched_nodes=1,
+            launched_resources=launched_resources,
+        )
+        handle.provision_runtime_metadata = (
+            cloud_vm_ray_backend.provision_common.ProvisionRuntimeMetadata(
+                has_ray=has_ray))
+        handle.close_skylet_ssh_tunnel = MagicMock()
+        return handle
+
+    def test_uses_refreshed_handle_to_avoid_stale_metadata(self):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        stale_handle = self._make_handle('test-cluster',
+                                         '/tmp/stale.yaml',
+                                         has_ray=True)
+        refreshed_handle = self._make_handle('test-cluster',
+                                             '/tmp/refreshed.yaml',
+                                             has_ray=False)
+
+        with patch(
+                'sky.backends.cloud_vm_ray_backend.requests_lib.'
+                'kill_cluster_requests'), patch(
+                    'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                    'refresh_cluster_status_handle',
+                    return_value=(
+                        status_lib.ClusterStatus.UP, refreshed_handle)), patch(
+                            'sky.backends.cloud_vm_ray_backend.'
+                            'global_user_state.'
+                            'get_cluster_yaml_dict',
+                            return_value={'provider': {
+                            }}) as (mock_get_yaml), patch(
+                                'sky.backends.cloud_vm_ray_backend'
+                                '.provisioner.teardown_cluster'), patch.object(
+                                    backend,
+                                    'post_teardown_cleanup'), patch.object(
+                                        backend,
+                                        'run_on_head') as mock_run_on_head:
+            backend.teardown_no_lock(stale_handle,
+                                     terminate=True,
+                                     refresh_cluster_status=True)
+
+        mock_run_on_head.assert_not_called()
+        mock_get_yaml.assert_called_once_with(refreshed_handle.cluster_yaml)
+
+
+class TestNewHandleRuntimeMetadata:
+    """Runtime metadata a freshly constructed handle starts with."""
+
+    def test_new_handle_has_no_runtime_established(self):
+        """A new handle is created before provisioning, so it claims no Ray.
+
+        Otherwise teardown of a cluster that crashed or recovered during
+        provisioning attempts ``ray stop`` on a runtime that was never set
+        up.
+        """
+        handle = CloudVmRayResourceHandle(
+            cluster_name='test-cluster',
+            cluster_name_on_cloud='test-cluster-abc',
+            cluster_yaml=None,
+            launched_nodes=1,
+            launched_resources=MagicMock(),
+        )
+        metadata = handle.provision_runtime_metadata
+        assert (metadata.has_ray, metadata.has_skylet, metadata.has_job_queue,
+                metadata.ssh_available) == (False, False, False, False)
+
+
+class TestProvisionClusterLockParking:
+    """_provision on lock contention: park as WAITING only in request ctx."""
+
+    def _run_provision(self,
+                       monkeypatch,
+                       in_request_context,
+                       locked_provision_mock,
+                       is_launched_by_jobs_controller=False):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        backend._is_launched_by_jobs_controller = (
+            is_launched_by_jobs_controller)
+        monkeypatch.setattr('sky.backends.backend_utils.check_rsync_installed',
+                            lambda: None)
+        monkeypatch.setattr('sky.backends.backend_utils.check_owner_identity',
+                            lambda cluster_name: None)
+        monkeypatch.setattr('sky.utils.common_utils.is_in_request_context',
+                            lambda: in_request_context)
+        monkeypatch.setattr('sky.utils.rich_utils.force_update_status',
+                            lambda msg: None)
+        monkeypatch.setattr(backend, '_locked_provision', locked_provision_mock)
+        return backend._provision(MagicMock(),
+                                  None,
+                                  dryrun=False,
+                                  stream_logs=False,
+                                  cluster_name='test-cluster')
+
+    def test_parks_on_lock_contention_in_request_context(self, monkeypatch):
+        locked_provision = MagicMock(side_effect=locks.LockTimeout('locked'))
+        with pytest.raises(exceptions.ExecutionPausedError) as exc_info:
+            self._run_provision(monkeypatch,
+                                in_request_context=True,
+                                locked_provision_mock=locked_provision)
+        assert 'test-cluster' in str(exc_info.value)
+        assert (exc_info.value.retry_wait_seconds ==
+                cloud_vm_ray_backend._CLUSTER_LOCK_RETRY_GAP_SECONDS)
+        condition = exc_info.value.continue_condition
+        assert isinstance(condition, locks.LockAcquirableCondition)
+        assert condition._lock_id == 'test-cluster_status'
+        assert locked_provision.call_count == 1
+
+    def test_blocks_on_lock_contention_outside_request_context(
+            self, monkeypatch):
+        sentinel = (MagicMock(), False)
+        locked_provision = MagicMock(
+            side_effect=[locks.LockTimeout('locked'), sentinel])
+        result = self._run_provision(monkeypatch,
+                                     in_request_context=False,
+                                     locked_provision_mock=locked_provision)
+        assert result is sentinel
+        assert locked_provision.call_count == 2
+
+    def test_parks_for_jobs_controller_launch_in_request_context(
+            self, monkeypatch):
+        # A jobs-controller launch running as a scheduler-managed request
+        # (consolidation mode submits launches via the SDK like any other
+        # request) must park like any other request: blocking instead would
+        # pin one executor worker per lock contender (e.g. duplicate launch
+        # requests for the same cluster after controller retries), starving
+        # the worker pool at scale.
+        locked_provision = MagicMock(side_effect=locks.LockTimeout('locked'))
+        with pytest.raises(exceptions.ExecutionPausedError) as exc_info:
+            self._run_provision(monkeypatch,
+                                in_request_context=True,
+                                locked_provision_mock=locked_provision,
+                                is_launched_by_jobs_controller=True)
+        condition = exc_info.value.continue_condition
+        assert isinstance(condition, locks.LockAcquirableCondition)
+        assert locked_provision.call_count == 1
+
+    def test_blocks_for_jobs_controller_launch_outside_request_context(
+            self, monkeypatch):
+        # Without a request context there is no scheduler to park/resume the
+        # request, so the blocking behavior is kept regardless of the
+        # jobs-controller flag.
+        sentinel = (MagicMock(), False)
+        locked_provision = MagicMock(
+            side_effect=[locks.LockTimeout('locked'), sentinel])
+        result = self._run_provision(monkeypatch,
+                                     in_request_context=False,
+                                     locked_provision_mock=locked_provision,
+                                     is_launched_by_jobs_controller=True)
+        assert result is sentinel
+        assert locked_provision.call_count == 2
+
+
+class TestSlurmContainerImageBackfill:
+    """Backfilling provider.container_image for pre-upgrade Slurm clusters."""
+
+    @staticmethod
+    def _handle(cloud, image):
+        launched = MagicMock()
+        launched.cloud = MagicMock(spec=cloud)
+        launched.extract_docker_image.return_value = image
+        return CloudVmRayResourceHandle(
+            cluster_name='test-cluster',
+            cluster_name_on_cloud='test-cluster-abc',
+            cluster_yaml='test-cluster.yml',
+            launched_nodes=1,
+            launched_resources=launched,
+        )
+
+    def test_backfills_legacy_container_cluster(self):
+        handle = self._handle(clouds.Slurm, 'ubuntu:24.04')
+        with patch('sky.global_user_state.get_cluster_yaml_dict',
+                   return_value={'provider': {'cluster': 'c'}}), \
+             patch('sky.global_user_state.set_cluster_yaml') as mock_set:
+            handle._maybe_backfill_slurm_container_image()
+        mock_set.assert_called_once()
+        name, written = mock_set.call_args.args
+        assert name == 'test-cluster'
+        from sky.utils import yaml_utils
+        assert (yaml_utils.safe_load(written)['provider']['container_image'] ==
+                'ubuntu:24.04')
+
+    def test_noop_when_already_present(self):
+        handle = self._handle(clouds.Slurm, 'ubuntu:24.04')
+        with patch('sky.global_user_state.get_cluster_yaml_dict',
+                   return_value={'provider': {
+                       'container_image': 'ubuntu:24.04'
+                   }}), \
+             patch('sky.global_user_state.set_cluster_yaml') as mock_set:
+            handle._maybe_backfill_slurm_container_image()
+        mock_set.assert_not_called()
+
+    def test_reconciles_stale_value(self):
+        handle = self._handle(clouds.Slurm, 'ubuntu:24.04')
+        with patch('sky.global_user_state.get_cluster_yaml_dict',
+                   return_value={'provider': {
+                       'container_image': 'old:1'
+                   }}), \
+             patch('sky.global_user_state.set_cluster_yaml') as mock_set:
+            handle._maybe_backfill_slurm_container_image()
+        _, written = mock_set.call_args.args
+        from sky.utils import yaml_utils
+        assert (yaml_utils.safe_load(written)['provider']['container_image'] ==
+                'ubuntu:24.04')
+
+    def test_noop_for_non_container_slurm(self):
+        handle = self._handle(clouds.Slurm, None)
+        with patch('sky.global_user_state.get_cluster_yaml_dict') as mock_get, \
+             patch('sky.global_user_state.set_cluster_yaml') as mock_set:
+            handle._maybe_backfill_slurm_container_image()
+        mock_get.assert_not_called()
+        mock_set.assert_not_called()
+
+    def test_noop_for_non_slurm_cloud(self):
+        handle = self._handle(clouds.AWS, 'ubuntu:24.04')
+        with patch('sky.global_user_state.get_cluster_yaml_dict') as mock_get, \
+             patch('sky.global_user_state.set_cluster_yaml') as mock_set:
+            handle._maybe_backfill_slurm_container_image()
+        mock_get.assert_not_called()
+        mock_set.assert_not_called()
