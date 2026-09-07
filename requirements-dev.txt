@@ -3,9 +3,6 @@
 yapf==0.32.0
 # match the version with .pre-commit-config.yaml
 pylint==2.14.5
-# formatting the node_providers code from upstream ray-project/ray project
-# match the version with .pre-commit-config.yaml
-black==22.10.0
 # https://github.com/edaniszewski/pylint-quotes
 # match the version with .pre-commit-config.yaml
 pylint-quotes==0.2.3
@@ -51,7 +48,12 @@ boto3-stubs[s3,ec2,sts,iam,service-quotas]
 psycopg2-binary==2.9.10
 
 # For helm okta test
-selenium==4.33.0
+# Floor, not an exact pin: selenium 4.33.0 requires `typing_extensions~=4.13.2`,
+# which caps typing_extensions at 4.13.x for the whole dev environment. Any
+# upstream package that adopts `typing_extensions.Sentinel`/`sentinel` (added in
+# 4.15.0) then fails to import -- pydantic-core 2.41.x did, and anyio 4.15.0
+# does. 4.36.0 is the first release that drops the `~=` cap.
+selenium>=4.36.0
 webdriver-manager==4.0.2
 
 # For grpcio/protobuf code generation
@@ -63,13 +65,7 @@ webdriver-manager==4.0.2
 # to make sure it's always up to date.
 grpcio-tools==1.63.0
 grpcio==1.63.0
-# The oldest version of protobuf that grpcio 1.63.0 supports.
-protobuf==5.26.1
-
-# Pin to avoid a runtime break between pydantic>=2.12 (which requires
-# pydantic-core 2.41.x) and typing_extensions 4.13.x. In 2.41.x,
-# pydantic-core does `from typing_extensions import Sentinel`, but 4.13.x no
-# longer exports the public `Sentinel` symbol, causing ImportError. Keeping
-# pydantic<2.12 avoids pulling pydantic-core 2.41.x. Revisit once upstream
-# resolves the import or we align versions accordingly.
-pydantic<2.12
+# Bumped from 5.26.1 to 5.29.6 to close CVE-2025-4565 (DoS) and
+# CVE-2026-0994 (JSON recursion bypass). grpcio 1.63.0 supports
+# protobuf >= 5.x, so this minor bump is compatible.
+protobuf==5.29.6

@@ -1,7 +1,10 @@
 """SDK functions for managed jobs."""
+import datetime
 import ipaddress
 import os
 import pathlib
+import shlex
+import sys
 import tempfile
 import time
 import typing
@@ -47,11 +50,13 @@ from sky.utils import common
 from sky.utils import common_utils
 from sky.utils import controller_utils
 from sky.utils import dag_utils
+from sky.utils import infra_utils
 from sky.utils import rich_utils
 from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import timeline
 from sky.utils import ux_utils
+from sky.workspaces import constants as workspace_constants
 from sky.workspaces import core as workspaces_core
 
 if typing.TYPE_CHECKING:
@@ -213,26 +218,7 @@ def _upload_files_to_controller(dag: 'sky.Dag') -> Dict[str, str]:
 
 
 def _job_ids_to_str(job_ids: Optional[List[int]]) -> str:
-    if not job_ids:
-        return ''
-
-    if len(job_ids) == 1:
-        return str(job_ids[0])
-
-    job_ids = sorted(job_ids)
-    ranges = []
-    start = prev = job_ids[0]
-
-    for n in job_ids[1:]:
-        if n == prev + 1:
-            prev = n
-            continue
-        ranges.append(f'{start}-{prev}' if start != prev else str(start))
-        start = prev = n
-
-    # append last range
-    ranges.append(f'{start}-{prev}' if start != prev else str(start))
-    return ','.join(ranges)
+    return managed_job_utils.format_job_ids_as_ranges(job_ids)
 
 
 class _DefaultManagedJobRunner:
@@ -253,6 +239,7 @@ class _DefaultManagedJobRunner:
         workspace_match: Optional[str],
         name_match: Optional[str],
         pool_match: Optional[str],
+        infra_match: Optional[str],
         page: Optional[int],
         limit: Optional[int],
         user_hashes: Optional[List[Optional[str]]],
@@ -260,14 +247,16 @@ class _DefaultManagedJobRunner:
         fields: Optional[List[str]],
         sort_by: Optional[str],
         sort_order: Optional[str],
+        submitted_after: Optional[float],
+        submitted_before: Optional[float],
     ) -> Tuple[List[Dict[str, Any]], int,
-               'managed_job_utils.ManagedJobQueueResultType', int, Dict[str,
-                                                                        int]]:
+               'managed_job_utils.ManagedJobQueueResultType', int, Dict[
+                   str, int], List[str]]:
         """Fetch the managed jobs table from the jobs controller.
 
         Returns:
             A tuple of (jobs, total, result_type, total_no_filter,
-            status_counts):
+            status_counts, infra_options):
               jobs: The paginated managed job records matching the filters.
               total: Total jobs matching the filters (before pagination).
               result_type: DICT when the controller returned a dict with
@@ -275,12 +264,30 @@ class _DefaultManagedJobRunner:
               total_no_filter: Total jobs without any filters applied.
               status_counts: Mapping of job status -> count across all jobs
                   matching the filters.
+              infra_options: The distinct `--infra` specs the filters select,
+                  for the dashboard's Infra filter to offer. Empty from a
+                  controller that predates the field.
         """
         with metrics_lib.time_it('jobs.queue.generate_code', group='jobs'):
+            # By name: the parameter list is long enough that inserting one
+            # in the middle would silently shift every argument after it.
             code = managed_job_utils.ManagedJobCodeGen.get_job_table(
-                skip_finished, accessible_workspaces, job_ids, workspace_match,
-                name_match, pool_match, page, limit, user_hashes, statuses,
-                fields, sort_by, sort_order)
+                skip_finished=skip_finished,
+                accessible_workspaces=accessible_workspaces,
+                job_ids=job_ids,
+                workspace_match=workspace_match,
+                name_match=name_match,
+                pool_match=pool_match,
+                infra_match=infra_match,
+                page=page,
+                limit=limit,
+                user_hashes=user_hashes,
+                statuses=statuses,
+                fields=fields,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                submitted_after=submitted_after,
+                submitted_before=submitted_before)
         with metrics_lib.time_it('jobs.queue.run_on_head', group='jobs'):
             returncode, job_table_payload, stderr = backend.run_on_head(
                 handle,
@@ -290,14 +297,27 @@ class _DefaultManagedJobRunner:
                 separate_stderr=True)
 
         if returncode != 0:
-            logger.error(job_table_payload + stderr)
+            output = job_table_payload + stderr
+            marker = managed_job_utils.INFRA_FILTER_UNSUPPORTED_MARKER
+            if marker in output:
+                # The controller refused the infra filter rather than answering
+                # without it. Its message names the version it actually runs,
+                # so surface that line on its own instead of a traceback.
+                detail = output.partition(f'{marker}: ')[2].splitlines()
+                with ux_utils.print_exception_no_traceback():
+                    raise exceptions.NotSupportedError(
+                        detail[0].strip() if detail else managed_job_utils.
+                        INFRA_FILTER_UNSUPPORTED_MESSAGE)
+            logger.error(output)
             raise RuntimeError('Failed to fetch managed jobs with returncode: '
-                               f'{returncode}.\n{job_table_payload + stderr}')
+                               f'{returncode}.\n{output}')
 
         with metrics_lib.time_it('jobs.queue.load_job_queue', group='jobs'):
-            (jobs, total, result_type, total_no_filter, status_counts
+            (jobs, total, result_type, total_no_filter, status_counts,
+             infra_options
             ) = managed_job_utils.load_managed_job_queue(job_table_payload)
-        return jobs, total, result_type, total_no_filter, status_counts
+        return (jobs, total, result_type, total_no_filter, status_counts,
+                infra_options)
 
     def cancel_managed_jobs(
         self,
@@ -347,6 +367,7 @@ class _DefaultManagedJobRunner:
         follow: bool,
         controller: bool,
         tail: Optional[int],
+        tail_offset: Optional[int] = None,
         task: Optional[Union[str, int]],
     ) -> int:
         return backend.tail_managed_job_logs(handle,
@@ -355,6 +376,7 @@ class _DefaultManagedJobRunner:
                                              follow=follow,
                                              controller=controller,
                                              tail=tail,
+                                             tail_offset=tail_offset,
                                              task=task)
 
 
@@ -381,10 +403,15 @@ def _consolidated_launch(
     run_script = '\n'.join(env_cmds + [run_script])
     # Dump script for high availability recovery.
     assert job_ids is not None, 'job_ids not set'
-    log_dir = os.path.join(skylet_constants.SKY_LOGS_DIRECTORY, 'managed_jobs')
+    log_dir = os.path.expanduser(
+        os.path.join(skylet_constants.SKY_LOGS_DIRECTORY, 'managed_jobs'))
     os.makedirs(log_dir, exist_ok=True)
     job_ids_str = _job_ids_to_str(job_ids)
     log_path = os.path.join(log_dir, f'submit-job-{job_ids_str}.log')
+    # LocalProcessCommandRunner (used for consolidation-mode spawns) sets
+    # a clean server env on the subprocess by default to keep per-request
+    # env pollution from leaking into the long-lived controller process
+    # tree. See LocalProcessCommandRunner.run for details.
     backend.run_on_head(local_handle, run_script, log_path=log_path)
     ux_utils.starting_message(f'Job submitted, ID: {job_ids_str}')
     return job_ids, local_handle
@@ -430,11 +457,14 @@ def _maybe_submit_job_locally(
         is_batch = any(
             t.metadata.get('batch_coordinator', False) for t in dag.tasks)
         assert dag.name is not None, 'dag must have a name'
+        # Read the resolver-set thread-local directly. `force_user_workspace`
+        # would drop back to the literal 'default' for users who never set
+        # `active_workspace` server-side, which breaks users without
+        # access to the 'default' workspace.
         consolidation_mode_job_id = (
             managed_job_state.set_job_info_without_job_id(
                 dag.name,
-                workspace=skypilot_config.get_active_workspace(
-                    force_user_workspace=True),
+                workspace=skypilot_config.get_active_workspace(),
                 entrypoint=common_utils.get_current_command(),
                 pool=pool,
                 pool_hash=pool_hash,
@@ -552,7 +582,12 @@ def _submit_remotely(controller: controller_utils.Controllers,
     backend = backend_utils.get_backend_from_handle(local_handle)
     assert isinstance(backend, backends.CloudVmRayBackend)
 
-    workspace = skypilot_config.get_active_workspace(force_user_workspace=True)
+    # `_ensure_controller_up` has already entered AND exited its own
+    # `local_active_workspace_ctx`, so the thread-local here is the
+    # outer (resolver-set) workspace. See the consolidation-mode
+    # counterpart in `_maybe_submit_job_locally` for why
+    # `force_user_workspace` is not used.
+    workspace = skypilot_config.get_active_workspace()
     entrypoint = common_utils.get_current_command()
     pool_hash = serve_state.get_service_hash(pool) if pool else None
     user_hash = common_utils.get_user_hash()
@@ -618,13 +653,14 @@ def _create_job_api_token(creator_user_id: str, job_name: Optional[str],
     # pylint: disable=import-outside-toplevel
     from sky.users.token_service import token_service
 
-    token_name = f'managed-job-{job_name or "unnamed"}-{dag_uuid[:8]}'
+    token_name = (f'{managed_job_constants.MANAGED_JOB_TOKEN_NAME_PREFIX}'
+                  f'{job_name or "unnamed"}-{dag_uuid[:8]}')
 
     token_data = token_service.create_token(
         creator_user_id=creator_user_id,
         service_account_user_id=creator_user_id,
         token_name=token_name,
-        expires_in_days=7)
+        expires_in_days=managed_job_constants.MANAGED_JOB_TOKEN_TTL_DAYS)
 
     global_user_state.add_service_account_token(
         token_id=token_data['token_id'],
@@ -695,11 +731,11 @@ def launch(
     dag.resolve_and_validate_volumes()
     if not dag.is_chain() and not dag.is_job_group():
         with ux_utils.print_exception_no_traceback():
-            raise ValueError('Only single-task, chain DAG, or JobGroup is '
+            raise ValueError('Only single-task, chain DAG, or Job Group is '
                              f'allowed for job_launch. Dag: {dag}')
     if dag.is_job_group() and pool is not None:
         with ux_utils.print_exception_no_traceback():
-            raise ValueError('JobGroups do not support pools. Please remove '
+            raise ValueError('Job Groups do not support pools. Please remove '
                              'the --pool argument when launching a job group.')
     dag.validate()
     # TODO(aylei): use consolidated job controller instead of performing
@@ -728,18 +764,35 @@ def launch(
                         override_params['region'] = best_region
                     task_.set_resources_override(override_params)
 
-        # Warn if job group is not running on Kubernetes (networking won't work)
-        first_task = dag.tasks[0]
-        if first_task.best_resources is not None:
-            best_cloud = first_task.best_resources.cloud
-            if best_cloud is not None and str(
-                    best_cloud).lower() != 'kubernetes':
-                logger.warning(
-                    f'{colorama.Fore.YELLOW}Job group service discovery '
-                    f'(hostname-based networking) is only supported on '
-                    f'Kubernetes. Tasks will run on {best_cloud} but cannot '
-                    f'communicate with each other using hostnames.'
-                    f'{colorama.Style.RESET_ALL}')
+        # Post-optimization invariant: a group that still has in-group
+        # networking enabled (inter_connection unset or true) was placed
+        # by the same-infra path, which pins every job to one cloud (and
+        # to Kubernetes: unset degrades to False in the optimizer when
+        # placed elsewhere, and explicit true only ever gets Kubernetes
+        # candidates). Heterogeneous placements only arise via
+        # independent placement, which always carries
+        # inter_connection == False.
+        if dag.inter_connection is not False:
+            best_clouds = {
+                str(task_.best_resources.cloud)
+                for task_ in dag.tasks
+                if task_.best_resources is not None and
+                task_.best_resources.cloud is not None
+            }
+            if (len(best_clouds) > 1 or not all(cloud.lower() == 'kubernetes'
+                                                for cloud in best_clouds)):
+                with ux_utils.print_exception_no_traceback():
+                    raise RuntimeError(
+                        f'Internal error: Job Group {dag.name!r} requires '
+                        'in-group networking (inter_connection is enabled), '
+                        'which is only supported on a single Kubernetes '
+                        'cluster, but the optimizer placed it on '
+                        f'{sorted(best_clouds)}. This is likely a SkyPilot '
+                        'bug; please report it at '
+                        'https://github.com/skypilot-org/skypilot/issues. '
+                        'Set \'inter_connection: false\' '
+                        'in the job group header if the jobs do not need '
+                        'to reach each other by hostname.')
 
     # If there is a local postgres db, when the api server tries launching on
     # the remote jobs controller it will fail. therefore, we should remove this
@@ -860,9 +913,6 @@ def launch(
         controller=controller,
         task_resources=sum([list(t.resources) for t in dag.tasks], []))
 
-    if num_jobs and pool is None:
-        raise ValueError('Cannot specify num_jobs without pool.')
-
     num_jobs = num_jobs if num_jobs is not None else 1
     # We do this assignment after applying the admin policy, so that we don't
     # need to serialize the pool name in the dag. The dag object will be
@@ -963,6 +1013,9 @@ def launch(
             'priority': priority,
             'priority_class': priority_class,
             'is_consolidation_mode': is_consolidation_mode,
+            'jobs_scheduler_python_cmd':
+                (shlex.quote(sys.executable)
+                 if is_consolidation_mode else skylet_constants.SKY_PYTHON_CMD),
             'pool': pool,
             'job_controller_indicator_file':
                 managed_job_constants.JOB_CONTROLLER_INDICATOR_FILE,
@@ -1117,7 +1170,7 @@ def queue_from_kubernetes_pod(
     except exceptions.CommandError as e:
         raise RuntimeError(str(e)) from e
 
-    jobs, _, result_type, _, _ = managed_job_utils.load_managed_job_queue(
+    jobs, _, result_type, _, _, _ = managed_job_utils.load_managed_job_queue(
         job_table_payload)
 
     if result_type == managed_job_utils.ManagedJobQueueResultType.DICT:
@@ -1214,7 +1267,15 @@ def queue(refresh: bool,
             does not exist.
         RuntimeError: if failed to get the managed jobs with ssh.
     """
-    jobs, _, _, _ = queue_v2(refresh, skip_finished, all_users, job_ids)
+    # The deprecated v1 queue body cannot request specific fields, so default
+    # to the lightweight field set to avoid returning heavy fields (e.g. the
+    # task YAML) for every job, which is expensive with many jobs.
+    jobs, _, _, _, _ = queue_v2(
+        refresh,
+        skip_finished,
+        all_users,
+        job_ids,
+        fields=list(managed_job_constants.DEFAULT_MANAGED_JOB_FIELDS))
 
     return jobs
 
@@ -1229,21 +1290,51 @@ def queue_v2_api(
     workspace_match: Optional[str] = None,
     name_match: Optional[str] = None,
     pool_match: Optional[str] = None,
+    infra_match: Optional[str] = None,
     page: Optional[int] = None,
     limit: Optional[int] = None,
     statuses: Optional[List[str]] = None,
     fields: Optional[List[str]] = None,
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = None,
-) -> Tuple[List[responses.ManagedJobRecord], int, Dict[str, int], int]:
+    submitted_after: Optional[float] = None,
+    submitted_before: Optional[float] = None,
+) -> Tuple[List[responses.ManagedJobRecord], int, Dict[str, int], int,
+           List[str]]:
     """Gets statuses of managed jobs and parse the
     jobs to responses.ManagedJobRecord."""
-    jobs, total, status_counts, total_no_filter = queue_v2(
-        refresh, skip_finished, all_users, job_ids, user_match, workspace_match,
-        name_match, pool_match, page, limit, statuses, fields, sort_by,
-        sort_order)
-    return [responses.ManagedJobRecord(**job) for job in jobs
-           ], total, status_counts, total_no_filter
+    jobs, total, status_counts, total_no_filter, infra_options = queue_v2(
+        refresh=refresh,
+        skip_finished=skip_finished,
+        all_users=all_users,
+        job_ids=job_ids,
+        user_match=user_match,
+        workspace_match=workspace_match,
+        name_match=name_match,
+        pool_match=pool_match,
+        infra_match=infra_match,
+        page=page,
+        limit=limit,
+        statuses=statuses,
+        fields=fields,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        submitted_after=submitted_after,
+        submitted_before=submitted_before)
+    if fields:
+        # The queue records carry every known column (None for the ones the
+        # query didn't select). Callers that pass ``fields`` have declared
+        # exactly what they read, so drop the other keys here; the response
+        # encoder's exclude_unset then leaves them out of the payload
+        # entirely. On wide job tables the key/None overhead otherwise
+        # dominates the response size (~1.4KB per job — tens of MB at tens
+        # of thousands of jobs). ``job_id``, ``task_id`` and ``status`` are
+        # always kept: the server force-selects them (see _update_fields)
+        # and clients key records on them.
+        keep = set(fields) | {'job_id', 'task_id', 'status'}
+        jobs = [{k: v for k, v in job.items() if k in keep} for job in jobs]
+    return ([responses.ManagedJobRecord(**job) for job in jobs], total,
+            status_counts, total_no_filter, infra_options)
 
 
 @metrics_lib.time_me
@@ -1256,13 +1347,16 @@ def queue_v2(
     workspace_match: Optional[str] = None,
     name_match: Optional[str] = None,
     pool_match: Optional[str] = None,
+    infra_match: Optional[str] = None,
     page: Optional[int] = None,
     limit: Optional[int] = None,
     statuses: Optional[List[str]] = None,
     fields: Optional[List[str]] = None,
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = None,
-) -> Tuple[List[Dict[str, Any]], int, Dict[str, int], int]:
+    submitted_after: Optional[float] = None,
+    submitted_before: Optional[float] = None,
+) -> Tuple[List[Dict[str, Any]], int, Dict[str, int], int, List[str]]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Gets statuses of managed jobs with filtering.
 
@@ -1291,11 +1385,21 @@ def queue_v2(
         total: int, total number of jobs after filter
         status_counts: Dict[str, int], status counts after filter
         total_no_filter: int, total number of jobs before filter
+        infra_options: List[str], the distinct `--infra` specs the other
+            filters select, for the dashboard's Infra filter to offer. Empty
+            when the jobs controller predates the field, which is not an
+            error: the caller falls back to the rows it has.
     Raises:
         sky.exceptions.ClusterNotUpError: the jobs controller is not up or
             does not exist.
         RuntimeError: if failed to get the managed jobs with ssh.
     """
+    if infra_match is not None:
+        # Parse here so a malformed spec is rejected against the input the
+        # caller typed, rather than surfacing from the controller wrapped in a
+        # remote traceback. The parsed value is discarded: the controller
+        # filters on the spec itself.
+        infra_utils.InfraInfo.from_str(infra_match)
     if limit is not None:
         if limit < 1:
             raise ValueError(f'Limit must be at least 1, got {limit}')
@@ -1327,11 +1431,14 @@ def queue_v2(
     elif user_match is not None:
         users = global_user_state.get_user_by_name_match(user_match)
         if not users:
-            return [], 0, {}, 0
+            return [], 0, {}, 0, []
         user_hashes = [user.id for user in users]
 
+    # Visibility, not usability: read-only workspaces' jobs must be listed. See
+    # the same call in backend_utils for clusters.
     accessible_workspaces = list(
-        workspaces_core.get_accessible_workspace_names())
+        workspaces_core.get_accessible_workspace_names(
+            action=workspace_constants.WORKSPACE_ACTION_READ))
 
     if handle.is_grpc_enabled_with_flag:
         try:
@@ -1344,6 +1451,7 @@ def queue_v2(
                 workspace_match=workspace_match,
                 name_match=name_match,
                 pool_match=pool_match,
+                infra_match=infra_match,
                 page=page,
                 limit=limit,
                 # Remove None from user_hashes, as the gRPC server uses the
@@ -1359,37 +1467,58 @@ def queue_v2(
                 show_jobs_without_user_hash=show_jobs_without_user_hash,
                 sort_by=sort_by,
                 sort_order=sort_order,
+                submitted_after=submitted_after,
+                submitted_before=submitted_before,
             )
             response = backend_utils.invoke_skylet_with_retries(
                 lambda: cloud_vm_ray_backend.SkyletClient(
                     handle.get_grpc_channel()).get_managed_job_table(request))
+            if infra_match is not None and not response.infra_match_applied:
+                # A field an old server does not know is dropped silently, and
+                # the rows it returns are on every infra. Refuse the answer
+                # rather than pass it off as filtered.
+                with ux_utils.print_exception_no_traceback():
+                    raise exceptions.NotSupportedError(
+                        managed_job_utils.INFRA_FILTER_UNSUPPORTED_MESSAGE)
             jobs = managed_job_utils.decode_managed_job_protos(response.jobs)
-            return jobs, response.total, dict(
-                response.status_counts), response.total_no_filter
+            return (jobs, response.total, dict(response.status_counts),
+                    response.total_no_filter, list(response.infra_options))
         except exceptions.SkyletMethodNotImplementedError:
             pass
 
-    (jobs, total, result_type, total_no_filter,
-     status_counts) = managed_job_runner.current().fetch_managed_job_table(
-         handle=handle,
-         backend=backend,
-         skip_finished=skip_finished,
-         accessible_workspaces=accessible_workspaces,
-         job_ids=job_ids,
-         workspace_match=workspace_match,
-         name_match=name_match,
-         pool_match=pool_match,
-         page=page,
-         limit=limit,
-         user_hashes=user_hashes,
-         statuses=statuses,
-         fields=fields,
-         sort_by=sort_by,
-         sort_order=sort_order,
-     )
+    fetched = managed_job_runner.current().fetch_managed_job_table(
+        handle=handle,
+        backend=backend,
+        skip_finished=skip_finished,
+        accessible_workspaces=accessible_workspaces,
+        job_ids=job_ids,
+        workspace_match=workspace_match,
+        name_match=name_match,
+        pool_match=pool_match,
+        infra_match=infra_match,
+        page=page,
+        limit=limit,
+        user_hashes=user_hashes,
+        statuses=statuses,
+        fields=fields,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        submitted_after=submitted_after,
+        submitted_before=submitted_before,
+    )
+    # A runner registered out of tree may still be on the five-value signature
+    # that predates the infra options. That costs the dashboard its option list
+    # -- it falls back to the rows it has -- and nothing else, so take it
+    # rather than fail the whole queue.
+    infra_options: List[str] = []
+    if len(fetched) == 5:
+        jobs, total, result_type, total_no_filter, status_counts = fetched
+    else:
+        (jobs, total, result_type, total_no_filter, status_counts,
+         infra_options) = fetched
 
     if result_type == managed_job_utils.ManagedJobQueueResultType.DICT:
-        return jobs, total, status_counts, total_no_filter
+        return jobs, total, status_counts, total_no_filter, infra_options
 
     # Backward compatibility for old jobs controller without filtering
     # TODO(hailong): remove this after 0.12.0
@@ -1435,7 +1564,9 @@ def queue_v2(
             enable_user_match=True,
             statuses=statuses,
         )
-    return filtered_jobs, total, status_counts, total_no_filter
+    # A LIST payload comes from a controller that filters nothing itself, so
+    # it carries no option list either; the caller falls back to its rows.
+    return filtered_jobs, total, status_counts, total_no_filter, infra_options
 
 
 @usage_lib.entrypoint
@@ -1541,6 +1672,7 @@ def tail_logs(name: Optional[str],
               controller: bool,
               refresh: bool,
               tail: Optional[int] = None,
+              tail_offset: Optional[int] = None,
               task: Optional[Union[str, int]] = None) -> int:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Tail logs of managed jobs.
@@ -1556,6 +1688,15 @@ def tail_logs(name: Optional[str],
         ValueError: invalid arguments.
         sky.exceptions.ClusterNotUpError: the jobs controller is not up.
     """
+    # A non-positive tail (0 or -1) is the established "all lines" sentinel
+    # (e.g. `sky jobs logs --tail 0`, and the dashboard log-download button
+    # which posts tail=0). Normalize it to None at this single server-side
+    # entry point so downstream tailing -- the OSS backward-seek reader, which
+    # asserts tail > 0, and any log-runtime plugin -- does not have to
+    # special-case it. Without this, tail=0 reaches the backward-seek read and
+    # raises AssertionError, producing an empty log download.
+    if tail is not None and tail <= 0:
+        tail = None
     # TODO(zhwu): Automatically restart the jobs controller
     if name is not None and job_id is not None:
         with ux_utils.print_exception_no_traceback():
@@ -1588,6 +1729,7 @@ def tail_logs(name: Optional[str],
         follow=follow,
         controller=controller,
         tail=tail,
+        tail_offset=tail_offset,
         task=task,
     )
 
@@ -1638,7 +1780,7 @@ def wait(name: Optional[str],
 
     # Resolve name to job_id on the first call.
     if name is not None:
-        records, _, _, _ = queue_v2_api(refresh=False, name_match=name)
+        records, _, _, _, _ = queue_v2_api(refresh=False, name_match=name)
         matching = [r for r in records if r.job_name == name]
         if not matching:
             with ux_utils.print_exception_no_traceback():
@@ -1651,7 +1793,7 @@ def wait(name: Optional[str],
     start_time = time.time()
 
     while True:
-        records, _, _, _ = queue_v2_api(refresh=False, job_ids=[job_id])
+        records, _, _, _, _ = queue_v2_api(refresh=False, job_ids=[job_id])
         if not records:
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(f'Managed job {job_id} not found.')
@@ -1814,11 +1956,47 @@ def pool_sync_down_logs(
                                pool=True)
 
 
+def _get_job_cluster_names(job_id: int,
+                           task_id: Optional[int] = None) -> List[str]:
+    """Reconstruct the underlying cluster name(s) for a managed job.
+
+    Mirrors the derivation used by the controller (see ``jobs/controller.py``):
+    a non-pool task's cluster is named deterministically from the *task* name
+    (``task.name``) and the job id. The task name is the right key here: for a
+    multi-task pipeline the job-level (DAG) name is shared across tasks, but
+    each task launches its own cluster named from ``task.name``
+    (``dag_utils`` sets ``task.name = f'{dag.name}-{task_id}'``). Pool tasks are
+    skipped, since their cluster is shared across jobs and its events are not
+    attributable to a single job.
+
+    Returns a de-duplicated list of cluster names (a multi-task pipeline uses
+    one cluster per task).
+    """
+    cluster_names: List[str] = []
+    for task in managed_job_state.get_managed_job_tasks(job_id):
+        if task_id is not None and task.get('task_id') != task_id:
+            continue
+        if task.get('pool') is not None:
+            continue
+        # 'task_name' is the per-task name (spot.task_name); 'job_name' is the
+        # job-level/DAG name, which is shared across a pipeline's tasks and so
+        # would reconstruct the wrong cluster name for multi-task jobs.
+        task_name = task.get('task_name')
+        if not task_name:
+            continue
+        cluster_names.append(
+            managed_job_utils.generate_managed_job_cluster_name(
+                task_name, job_id))
+    # De-duplicate while preserving order.
+    return list(dict.fromkeys(cluster_names))
+
+
 @usage_lib.entrypoint
 def get_job_events(
     job_id: int,
     task_id: Optional[int] = None,
     limit: Optional[int] = 10,
+    include_cluster_events: bool = False,
 ) -> List[Dict[str, Any]]:
     """Get task events for a managed job.
 
@@ -1826,10 +2004,69 @@ def get_job_events(
         job_id: The job ID to get task events for.
         task_id: Optional task ID to filter by.
         limit: Optional limit on number of task events to return (default 10).
+        include_cluster_events: When True, merge launch-progress events from
+            the job's underlying cluster (e.g. image pulling) into the
+            timeline so provisioning milestones between STARTING and RUNNING
+            are visible.
 
     Returns:
-        List of task event records.
+        List of task event records, ordered newest first.
     """
-    return managed_job_state.get_job_events(job_id=job_id,
-                                            task_id=task_id,
-                                            limit=limit)
+    events = managed_job_state.get_job_events(job_id=job_id,
+                                              task_id=task_id,
+                                              limit=limit)
+    if not include_cluster_events:
+        return events
+
+    try:
+        cluster_names = _get_job_cluster_names(job_id, task_id)
+    except Exception as e:  # pylint: disable=broad-except
+        # The merge is best-effort: never fail the job-events request because
+        # the cluster name(s) could not be reconstructed.
+        logger.debug(f'Failed to resolve cluster name(s) for job {job_id}: {e}')
+        return events
+
+    # STATUS_CHANGE carries the launch/setup milestone sequence (provisioning,
+    # runtime setup, file-mount syncing, ...); LAUNCH_PROGRESS carries the
+    # finer-grained sub-status (e.g. pods pending due to image pulling).
+    event_types = [
+        global_user_state.ClusterEventType.STATUS_CHANGE,
+        global_user_state.ClusterEventType.LAUNCH_PROGRESS,
+    ]
+    cluster_events: List[Dict[str, Any]] = []
+    for cluster_name in cluster_names:
+        try:
+            cluster_events.extend(
+                global_user_state.get_cluster_events_by_name(cluster_name,
+                                                             event_types,
+                                                             limit=limit))
+        except Exception as e:  # pylint: disable=broad-except
+            # Best-effort: skip a cluster whose events cannot be read.
+            logger.debug(f'Failed to read cluster events for job {job_id} '
+                         f'(cluster {cluster_name!r}): {e}')
+
+    # Match the timezone of the existing job-event timestamps so the merged
+    # cluster events serialize consistently. Postgres returns tz-aware
+    # datetimes while SQLite returns naive ones; mixing the two in one list
+    # makes the client interpret some timestamps in the wrong timezone.
+    # transitioned_at is a UTC epoch, so fromtimestamp(tz=...) yields the
+    # correct instant in whichever timezone the job events use.
+    tz = events[0]['timestamp'].tzinfo if events else None
+    for cluster_event in cluster_events:
+        events.append({
+            'spot_job_id': job_id,
+            'task_id': None,
+            # These happen while the job is launching its cluster.
+            'new_status': managed_job_state.ManagedJobStatus.STARTING,
+            'code': None,
+            'reason': cluster_event['reason'],
+            'timestamp': datetime.datetime.fromtimestamp(
+                cluster_event['transitioned_at'], tz=tz),
+        })
+
+    # Every event's 'timestamp' is a datetime (job events from the DB, cluster
+    # events converted above). datetime.timestamp() gives a comparable epoch.
+    events.sort(key=lambda event: event['timestamp'].timestamp(), reverse=True)
+    if limit is not None:
+        events = events[:limit]
+    return events

@@ -24,6 +24,7 @@ from sky import skypilot_config
 from sky.adaptors import aws
 from sky.backends import backend_utils
 from sky.jobs.server import utils as server_jobs_utils
+from sky.metrics import utils as metrics_utils
 from sky.provision import common as provision_common
 from sky.provision import constants as provision_constants
 from sky.provision import instance_setup
@@ -81,30 +82,36 @@ def _bulk_provision(
                                                cluster_name.name_on_cloud,
                                                config=config)
 
-    backoff = common_utils.Backoff(initial_backoff=1, max_backoff_factor=3)
-    logger.debug(f'\nWaiting for instances of {cluster_name!r} to be ready...')
-    rich_utils.force_update_status(
-        ux_utils.spinner_message('Launching - Checking instance status',
-                                 str(provision_logging.config.log_path),
-                                 cluster_name=str(cluster_name)))
-    # AWS would take a very short time (<<1s) updating the state of the
-    # instance.
-    time.sleep(1)
-    for retry_cnt in range(_MAX_RETRY):
-        try:
-            provision.wait_instances(provider_name,
-                                     region_name,
-                                     cluster_name.name_on_cloud,
-                                     state=status_lib.ClusterStatus.UP)
-            break
-        except (aws.botocore_exceptions().WaiterError, RuntimeError):
-            time.sleep(backoff.current_backoff())
-    else:
-        raise RuntimeError(
-            f'Failed to wait for instances of {cluster_name!r} to be '
-            f'ready on the cloud provider after max retries {_MAX_RETRY}.')
-    logger.debug(f'Instances of {cluster_name!r} are ready after {retry_cnt} '
-                 'retries.')
+    # Kubernetes-based clouds' run_instances already synchronously wait for all
+    # pods to be scheduled and running, and their wait_instances is a no-op,
+    # so skip the post-run wait/retry loop entirely.
+    if provider_name.lower() not in provision_constants.K8S_BASED_CLOUDS:
+        backoff = common_utils.Backoff(initial_backoff=1, max_backoff_factor=3)
+        logger.debug(
+            f'\nWaiting for instances of {cluster_name!r} to be ready...')
+        rich_utils.force_update_status(
+            ux_utils.spinner_message('Launching - Checking instance status',
+                                     str(provision_logging.config.log_path),
+                                     cluster_name=str(cluster_name)))
+        # AWS would take a very short time (<<1s) updating the state of the
+        # instance.
+        time.sleep(1)
+        for retry_cnt in range(_MAX_RETRY):
+            try:
+                provision.wait_instances(provider_name,
+                                         region_name,
+                                         cluster_name.name_on_cloud,
+                                         state=status_lib.ClusterStatus.UP)
+                break
+            except (aws.botocore_exceptions().WaiterError, RuntimeError):
+                time.sleep(backoff.current_backoff())
+        else:
+            raise RuntimeError(
+                f'Failed to wait for instances of {cluster_name!r} to be '
+                f'ready on the cloud provider after max retries {_MAX_RETRY}.')
+        logger.debug(
+            f'Instances of {cluster_name!r} are ready after {retry_cnt} '
+            'retries.')
 
     logger.debug(
         f'\nProvisioning {cluster_name!r} took {time.time() - start:.2f} '
@@ -161,8 +168,28 @@ def bulk_provision(
             redacted_config = bootstrap_config.get_redacted_config()
             logger.debug('Provision config:\n'
                          f'{json.dumps(redacted_config, indent=2)}')
-            return _bulk_provision(cloud, region, cluster_name,
-                                   bootstrap_config)
+            provision_start = time.time()
+            try:
+                provision_record = _bulk_provision(cloud, region, cluster_name,
+                                                   bootstrap_config)
+            except exceptions.ExecutionPausedError:
+                # A pause to wait on an external condition is neither a
+                # success nor a failure; the attempt resumes later.
+                raise
+            except (KeyboardInterrupt, SystemExit):
+                # User cancellation (SIGTERM on the executor surfaces as
+                # KeyboardInterrupt): not an outcome of the attempt, so
+                # record nothing.
+                raise
+            except BaseException:
+                metrics_utils.observe_provision_duration(
+                    repr(cloud), 'failure',
+                    time.time() - provision_start)
+                raise
+            metrics_utils.observe_provision_duration(
+                repr(cloud), 'success',
+                time.time() - provision_start)
+            return provision_record
         except exceptions.NoClusterLaunchedError:
             # Skip the teardown if the cluster was never launched.
             raise
@@ -175,6 +202,10 @@ def bulk_provision(
             # user config is inconsistent with the actual cluster.
             # This error is a user error instead of a provisioning failure.
             # And there is no possibility to fix it by teardown.
+            raise
+        except exceptions.ExecutionPausedError:
+            # Pausing to wait on an external condition: keep the resources for
+            # resume, do not tear down.
             raise
         except Exception as exc:  # pylint: disable=broad-except
             zone_str = 'all zones'

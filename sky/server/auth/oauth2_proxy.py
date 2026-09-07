@@ -12,16 +12,28 @@ import aiohttp
 import fastapi
 import starlette.middleware.base
 
+from sky import exceptions
 from sky import global_user_state
 from sky import models
 from sky import sky_logging
 from sky.server import constants as server_constants
 from sky.server import middleware_utils
+from sky.server.auth import db_lookup
 from sky.server.auth import loopback
-from sky.users import permission
 from sky.utils import common_utils
 
 logger = sky_logging.init_logger(__name__)
+
+HOP_BY_HOP_HEADERS = frozenset({
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+})
 
 
 @middleware_utils.websocket_aware
@@ -71,10 +83,15 @@ class OAuth2ProxyMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
                         allow_redirects=False,
                 ) as response:
                     response_body = await response.read()
+                    response_headers = {
+                        name: value
+                        for name, value in response.headers.items()
+                        if name.lower() not in HOP_BY_HOP_HEADERS
+                    }
                     fastapi_response = fastapi.responses.Response(
                         content=response_body,
                         status_code=response.status,
-                        headers=dict(response.headers),
+                        headers=response_headers,
                     )
                     # Forward cookies from OAuth2 proxy response to client
                     for cookie_name, cookie in response.cookies.items():
@@ -143,10 +160,24 @@ class OAuth2ProxyMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
                                 'return user info, check your oauth2-proxy'
                                 'setup.'
                         })
-                newly_added = global_user_state.add_or_update_user(auth_user)
-                if newly_added:
-                    permission.permission_service.add_user_if_not_exists(
-                        auth_user.id)
+                # Bounded and off the loop, matching the same call in
+                # `server.py`'s auth-proxy middleware. It is a database upsert:
+                # run inline, a slow database stalls this worker's event loop
+                # for every request, not just this login.
+                try:
+                    newly_added = await db_lookup.call_with_deadline(
+                        global_user_state.add_or_update_user, auth_user)
+                except asyncio.TimeoutError:
+                    logger.error('oauth2-proxy user upsert timed out')
+                    return db_lookup.db_timeout_response()
+                except exceptions.ConcurrentWorkerExhaustedError as e:
+                    logger.error(f'Concurrent worker exhausted during '
+                                 f'oauth2-proxy user upsert: {e}')
+                    return db_lookup.worker_exhausted_response()
+                failed = await db_lookup.ensure_role_for_authenticated_user(
+                    auth_user.id, newly_added)
+                if failed is not None:
+                    return failed
                 request.state.auth_user = auth_user
                 return await call_next(request)
             elif auth_response.status == http.HTTPStatus.UNAUTHORIZED:
@@ -188,8 +219,11 @@ class OAuth2ProxyMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
         """Extract user info from OAuth2 proxy response headers."""
         email_header = response.headers.get('X-Auth-Request-Email')
         if email_header:
-            user_hash = hashlib.md5(email_header.encode()).hexdigest(
-            )[:common_utils.USER_HASH_LENGTH]
+            # MD5 only derives a stable user id from the (non-secret) SSO
+            # email; auth itself is done by oauth2-proxy. Not a security use.
+            email_hash = hashlib.md5(email_header.encode(),
+                                     usedforsecurity=False).hexdigest()
+            user_hash = email_hash[:common_utils.USER_HASH_LENGTH]
             return models.User(id=user_hash,
                                name=email_header,
                                user_type=models.UserType.SSO.value)
