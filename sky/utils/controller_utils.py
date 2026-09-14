@@ -35,6 +35,7 @@ from sky.server.blob import blob_storage as bs
 from sky.setup_files import dependencies
 from sky.skylet import constants
 from sky.skylet import log_lib
+from sky.usage import constants as usage_constants
 from sky.utils import annotations
 from sky.utils import command_runner
 from sky.utils import common
@@ -469,10 +470,19 @@ def download_and_stream_job_log(
         backend: 'cloud_vm_ray_backend.CloudVmRayBackend',
         handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle',
         local_dir: str,
-        job_ids: Optional[List[str]] = None) -> Optional[str]:
+        job_ids: Optional[List[str]] = None,
+        on_downloaded: Optional[Callable[[str], None]] = None) -> Optional[str]:
     """Downloads and streams the latest job log.
 
     This function is only used by jobs controller and sky serve controller.
+
+    Args:
+        on_downloaded: Optional callback invoked with the local log path as
+            soon as the log has been synced down, BEFORE the (potentially
+            slow) re-streaming of the log into the controller log. The jobs
+            controller uses this to persist ``local_log_file`` immediately so
+            the dashboard can serve the job's logs without waiting for the
+            full re-stream to finish.
 
     If the log cannot be fetched for any reason, return None.
     """
@@ -507,11 +517,34 @@ def download_and_stream_job_log(
     log_dir = list(log_dirs.values())[0]
     log_file = os.path.expanduser(os.path.join(log_dir, 'run.log'))
 
+    # The log is now on local disk. Notify the caller immediately so it can
+    # persist the path (e.g. local_log_file) before the slow re-stream below,
+    # which can take minutes for multi-GB logs and would otherwise block the
+    # dashboard from serving the logs.
+    if on_downloaded is not None:
+        on_downloaded(log_file)
+
     # Print the logs to the console.
     # TODO(zhwu): refactor this into log_utils, along with the refactoring for
     # the log_lib.tail_logs.
     try:
-        with open(log_file, 'r', encoding='utf-8') as f:
+        # newline='\n' so we split lines ONLY on '\n'. The default
+        # universal-newline mode treats every '\r' as a line boundary, which
+        # for carriage-return progress output (e.g. `aws s3 cp`'s in-place
+        # "Completed X GiB ..." updates) explodes a multi-GB log into millions
+        # of "lines" -- making this loop O(carriage-returns) (minutes for a
+        # ~160MB log) and bloating the controller log accordingly. Splitting
+        # only on '\n' keeps it O(real lines). We also drop the per-line
+        # flush: stdout is block-buffered (~8KB), so a hard crash loses at
+        # most the last buffer, not the whole copy -- and the authoritative
+        # copy is the synced run.log on disk anyway. errors='replace' so a
+        # stray invalid-UTF-8 byte in the user log can't abort the copy
+        # mid-stream (matches log_lib's decode handling).
+        with open(log_file,
+                  'r',
+                  encoding='utf-8',
+                  newline='\n',
+                  errors='replace') as f:
             # Stream the logs to the console without reading the whole file into
             # memory.
             start_streaming = False
@@ -519,7 +552,9 @@ def download_and_stream_job_log(
                 if log_lib.LOG_FILE_START_STREAMING_AT in line:
                     start_streaming = True
                 if start_streaming:
-                    print(line, end='', flush=True)
+                    print(line, end='')
+        # Flush once after the full copy instead of once per line.
+        print(end='', flush=True)
     except FileNotFoundError:
         logger.error('Failed to find the logs for the user '
                      f'program at {log_file}.')
@@ -575,8 +610,15 @@ def shared_controller_vars_to_fill(
         constants.USING_REMOTE_API_SERVER_ENV_VAR: str(
             common_utils.get_using_remote_api_server()),
     })
-    if skypilot_config.loaded():
-        # Only set the SKYPILOT_CONFIG env var if the user has a config file.
+    # Only set the SKYPILOT_CONFIG env var when we actually file_mount a
+    # config to the controller (i.e. local_user_config was non-empty so
+    # local_user_config_path is a real tempfile that gets rsynced/SSH'd to
+    # remote_user_config_path on the controller). Previously this gated on
+    # `skypilot_config.loaded()` (API server's own config), which can be True
+    # even when local_user_config is empty — pointing the controller's
+    # SKYPILOT_CONFIG env to a file that was never created and crashing it
+    # with FileNotFoundError on startup.
+    if local_user_config_path is not None:
         env_vars[
             skypilot_config.ENV_VAR_SKYPILOT_CONFIG] = remote_user_config_path
     vars_to_fill['controller_envs'].update(env_vars)
@@ -625,6 +667,15 @@ def controller_only_vars_to_fill(controller: Controllers) -> Dict[str, str]:
     if override_concurrent_launches is not None:
         env_vars[constants.SERVE_OVERRIDE_CONCURRENT_LAUNCHES] = str(
             int(override_concurrent_launches))
+    # Forward the client's usage run id so the controller (and the worker
+    # clusters it provisions) report heartbeats under the same run id as
+    # the originating launch operation. Without this, in consolidation mode
+    # the controller process would fall back to its own
+    # usage_lib.messages.usage singleton, which is shared across all jobs
+    # served by that process and so cannot distinguish between them.
+    client_usage_run_id = os.environ.get(usage_constants.USAGE_RUN_ID_ENV_VAR)
+    if client_usage_run_id is not None:
+        env_vars[usage_constants.USAGE_RUN_ID_ENV_VAR] = client_usage_run_id
     vars_to_fill['controller_envs'] = env_vars
     return vars_to_fill
 
@@ -991,9 +1042,6 @@ def maybe_translate_local_file_mounts_and_sync_up(task: 'task_lib.Task',
 
     # We use uuid to generate a unique run id for the job, so that the bucket/
     # subdirectory name is unique across different jobs/services.
-    # We should not use common_utils.get_usage_run_id() here, because when
-    # Python API is used, the run id will be the same across multiple
-    # jobs.launch/serve.up calls after the sky is imported.
     run_id = _generate_run_uuid()
     user_hash = common_utils.get_user_hash()
     original_file_mounts = task.file_mounts if task.file_mounts else {}
@@ -1330,37 +1378,68 @@ MAX_TOTAL_RUNNING_JOBS = 2000
 _CONSOLIDATION_WORKER_MEMORY_FRACTION = 0.7
 
 
+def _controller_headroom_mb(reserve_extra_for_pool: bool) -> float:
+    """Memory kept free on top of whatever the controllers themselves use."""
+    headroom = float(MAXIMUM_CONTROLLER_RESERVED_MEMORY_MB)
+    if reserve_extra_for_pool:
+        headroom *= (1. + POOL_JOBS_RESOURCES_RATIO)
+    return headroom
+
+
+def _consolidation_worker_reserved_mb(reserve_extra_for_pool: bool) -> float:
+    """Headroom plus the share set aside for the in-process controllers.
+
+    Scales with system memory, so a machine that can run more concurrent jobs
+    also holds back more memory for their controller processes. Below
+    MIN_AVAIL_MB the controller share is skipped so workers get everything.
+    """
+    headroom = _controller_headroom_mb(reserve_extra_for_pool)
+    total_memory_mb = common_utils.get_mem_size_gb() * 1024 - headroom
+    min_avail_mb = (server_constants.MIN_AVAIL_MEM_GB_CONSOLIDATION_MODE * 1024)
+    controllers_reserved = min(
+        total_memory_mb * (1 - _CONSOLIDATION_WORKER_MEMORY_FRACTION),
+        max(0, total_memory_mb - min_avail_mb))
+    return headroom + controllers_reserved
+
+
 def compute_memory_reserved_for_controllers(
-        reserve_for_controllers: bool, reserve_extra_for_pool: bool) -> float:
-    reserved_memory_mb = 0.0
-    if reserve_for_controllers:
-        reserved_memory_mb = float(MAXIMUM_CONTROLLER_RESERVED_MEMORY_MB)
-        if reserve_extra_for_pool:
-            reserved_memory_mb *= (1. + POOL_JOBS_RESOURCES_RATIO)
-    return reserved_memory_mb
+        reserve_extra_for_pool: bool) -> float:
+    """Memory (MB) to withhold from API server worker sizing.
+
+    In consolidation mode the jobs and serve/pool controllers run as processes
+    inside the API server, so their memory has to be withheld before the
+    executor pools are sized. Returns the same quantity
+    _get_total_usable_memory_mb() assumes the workers left behind, so both
+    sides of the split agree on one number. Returns 0 outside consolidation
+    mode, where the controllers run on their own cluster.
+    """
+    if os.environ.get(constants.OVERRIDE_CONSOLIDATION_MODE) is not None:
+        # A local API server started from a controller process, which inherits
+        # its env. _get_parallelism() sizes that machine assuming only the flat
+        # headroom was withheld, so withhold exactly that.
+        return _controller_headroom_mb(reserve_extra_for_pool)
+    if not env_options.Options.MEMORY_AWARE_WORKER_SIZING.get():
+        return 0.0
+    # Either kind of consolidation puts controller processes in the API
+    # server's own memory.
+    if not is_jobs_consolidation_mode() and not _is_consolidation_mode(
+            pool=False):
+        return 0.0
+    return _consolidation_worker_reserved_mb(reserve_extra_for_pool)
 
 
 def _get_total_usable_memory_mb(pool: bool, consolidation_mode: bool) -> float:
-    controller_reserved = compute_memory_reserved_for_controllers(
-        reserve_for_controllers=True, reserve_extra_for_pool=pool)
-    total_memory_mb = (common_utils.get_mem_size_gb() * 1024 -
-                       controller_reserved)
+    headroom = _controller_headroom_mb(reserve_extra_for_pool=pool)
+    total_memory_mb = common_utils.get_mem_size_gb() * 1024 - headroom
     if not consolidation_mode:
         return total_memory_mb
-    # Cap the memory available for server workers so that both workers and
-    # services scale with system memory. Without this cap, short workers
-    # grow linearly with memory, consuming nearly all of it and leaving a
-    # roughly fixed amount for services regardless of system memory size.
-    # In low-memory scenarios (total_memory_mb <= MIN_AVAIL_MB), skip the
-    # service reservation so workers get all available memory; otherwise
-    # guarantee workers at least MIN_AVAIL_MB and cap them at the fraction.
-    min_avail_mb = (server_constants.MIN_AVAIL_MEM_GB_CONSOLIDATION_MODE * 1024)
-    service_reserved = min(
-        total_memory_mb * (1 - _CONSOLIDATION_WORKER_MEMORY_FRACTION),
-        max(0, total_memory_mb - min_avail_mb))
-    worker_reserved = controller_reserved + service_reserved
+    # Size the workers against the same reservation the API server uses, then
+    # hand the controllers whatever the workers did not take.
     config = server_config.compute_server_config(
-        deploy=True, quiet=True, reserved_memory_mb=worker_reserved)
+        deploy=True,
+        quiet=True,
+        reserved_memory_mb=_consolidation_worker_reserved_mb(
+            reserve_extra_for_pool=pool))
     used = 0.0
     used += ((config.long_worker_config.garanteed_parallelism +
               config.long_worker_config.burstable_parallelism) *
@@ -1368,6 +1447,10 @@ def _get_total_usable_memory_mb(pool: bool, consolidation_mode: bool) -> float:
     used += ((config.short_worker_config.garanteed_parallelism +
               config.short_worker_config.burstable_parallelism) *
              server_config.SHORT_WORKER_MEM_GB * 1024)
+    if env_options.Options.MEMORY_AWARE_WORKER_SIZING.get():
+        # Server workers are resident too, and the parent process with them.
+        used += ((config.num_server_workers + 1) *
+                 server_config.SERVER_WORKER_MEM_GB * 1024)
     return total_memory_mb - used
 
 

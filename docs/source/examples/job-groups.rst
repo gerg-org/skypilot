@@ -1,24 +1,18 @@
 .. _job-groups:
 
-Job Groups
-==========
-
-.. warning::
-
-  **This is an experimental feature.** The interface may change in future versions.
+Job Groups for RL
+=================
 
 Job Groups allow you to run multiple related tasks in parallel as a single managed unit.
 Unlike :ref:`managed jobs <managed-jobs>` which run tasks sequentially (pipelines),
 Job Groups launch all tasks simultaneously, enabling complex distributed architectures.
 
-.. figure:: ../images/job-groups-dashboard.png
+.. figure:: ../images/job-groups-rl-architecture.svg
    :width: 100%
    :align: center
-   :alt: Job Groups in SkyPilot Dashboard
+   :alt: SkyPilot Job Group: five tasks running in parallel for RL post-training — rollout-server and ppo-trainer on GPU; data-server, reward-server, and replay-buffer on CPU. Samples flow rollout → reward → buffer → trainer; policy weights loop back to rollout every step.
 
-   A Job Group with 4 tasks (data-server, rollout-server, reward-server, ppo-trainer)
-   running in parallel on Kubernetes. Each task has different resource requirements
-   and can be monitored independently through the dashboard.
+   A **SkyPilot Job Group** for RL post-training. Five heterogeneous tasks run side by side: samples flow rollout → reward → buffer → trainer, and new policy weights loop back to the rollout server every step.
 
 Overview
 --------
@@ -29,6 +23,7 @@ Overview
 - **Heterogeneous resources**: Different resource requirements per task (e.g., GPUs for training, CPUs for data serving)
 - **Automatic service discovery**: Tasks discover each other and communicate via hostnames
 - **Independent recovery**: Each task recovers from preemptions without affecting other tasks
+- **Launching jobs from inside the group**: A task can launch further managed jobs, which are listed under the group and cancelled with it
 
 **When to Use Job Groups:**
 
@@ -113,6 +108,19 @@ The header document supports the following fields:
        allowing them to finish pending work (e.g., flushing data). Can be a
        string (e.g., ``"30s"``, ``"5m"``) or a dict with per-task delays
        (e.g., ``{"default": "30s", "replay-buffer": "1m"}``).
+   * - ``inter_connection``
+     - ``None``
+     - Whether tasks need to reach each other by hostname.
+       ``true``: place all tasks on a single Kubernetes cluster and set
+       up hostname connectivity between them; hard-fail if either is not
+       possible. ``false``: deliberately skip all networking setup; tasks
+       still prefer co-location but may land on separate clusters.
+       Unset (default): assumes ``true`` — co-locate all tasks on a
+       single Kubernetes cluster and set up networking, unless the tasks
+       request non-Kubernetes infrastructure or pin infrastructures that
+       cannot be co-located, in which case it degrades to ``false`` with
+       a warning and skips networking setup.
+       See :ref:`job-groups-inter-connection`.
 
 Each task document after the header follows the standard :ref:`SkyPilot task YAML format <yaml-spec>`.
 
@@ -121,6 +129,8 @@ Each task document after the header follows the standard :ref:`SkyPilot task YAM
     Every task in a Job Group **must have a unique name**. The name is used for
     service discovery and log viewing.
 
+
+.. _job-groups-service-discovery:
 
 Service discovery
 -----------------
@@ -169,6 +179,52 @@ Example usage in a task:
     # Access the trainer task from the evaluator using the hostname
     curl http://trainer-0.${SKYPILOT_JOBGROUP_NAME}:8000/status
 
+.. _job-groups-inter-connection:
+
+Requiring or skipping in-group networking
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In-group service discovery is supported on Kubernetes. By default,
+in-group networking is enabled: SkyPilot places all tasks in a job group
+on a single Kubernetes cluster, and tasks wait for peer hostnames to
+become resolvable before running. If networking cannot be initialized,
+the job fails with a clear error rather than running without
+connectivity.
+
+Explicitly setting ``inter_connection: true`` is stricter than leaving it
+unset: placements where in-group networking cannot exist (non-Kubernetes
+infra, or infra pins with no common option) are rejected with an error,
+whereas with the field unset such placements proceed without networking
+and emit a warning.
+
+Set ``inter_connection: false`` in the header for tasks that do not need to
+reach each other by hostname (e.g., components that coordinate through an
+external endpoint or a shared object store):
+
+.. code-block:: yaml
+
+    name: my-job-group
+    execution: parallel
+    inter_connection: false
+    ---
+    # ... task documents ...
+
+With ``inter_connection: false``:
+
+- No in-group networking is set up, and tasks start immediately without
+  waiting for peers.
+- Tasks may be placed on **different Kubernetes clusters** when no single
+  cluster can host the whole group (e.g., the required GPU types live in
+  different clusters), or on non-Kubernetes infrastructure.
+- Tasks can also pin different clusters explicitly, via per-task
+  ``infra: k8s/<context>``.
+
+.. note::
+
+   Hostname-based service discovery across clusters is not yet
+   supported: tasks placed on different clusters cannot reach each other
+   via in-group hostnames.
+
 
 Viewing logs
 ------------
@@ -203,7 +259,7 @@ Parallel train-eval with shared storage
 This example runs training and evaluation in parallel, sharing checkpoints via
 a Kubernetes PVC volume:
 
-.. figure:: ../images/job-groups-train-eval-architecture.png
+.. figure:: ../images/job-groups-train-eval-architecture.svg
    :width: 80%
    :align: center
    :alt: Parallel Train-Eval Architecture with Job Groups
@@ -233,12 +289,12 @@ a Kubernetes PVC volume:
     run: |
       python evaluate.py --checkpoint-dir /checkpoints
 
-See the full example at ``llm/train-eval-jobgroup/`` in the SkyPilot repository.
+See the `full example <https://github.com/skypilot-org/skypilot/tree/master/llm/train-eval-jobgroup>`_ in the SkyPilot repository.
 
 RL post-training architecture
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-This example demonstrates a distributed RL post-training architecture with 5 tasks:
+This example demonstrates a distributed RL post-training architecture with 5 tasks (see the hero diagram at the top of the page). The trainer and rollout-server share a ``ReadWriteMany`` Kubernetes volume so the trainer can push freshly-updated policy weights back to the rollout-server every N steps, closing the RL feedback loop:
 
 .. code-block:: yaml
 
@@ -256,6 +312,8 @@ This example demonstrates a distributed RL post-training architecture with 5 tas
     num_nodes: 2
     resources:
       accelerators: A100:1
+    volumes:
+      /shared/policy: rlhf-policy
     run: |
       python rollout_server.py
     ---
@@ -276,13 +334,24 @@ This example demonstrates a distributed RL post-training architecture with 5 tas
     num_nodes: 2
     resources:
       accelerators: A100:1
+    volumes:
+      /shared/policy: rlhf-policy
     run: |
       python ppo_trainer.py \
         --data-server data-server-0.${SKYPILOT_JOBGROUP_NAME}:8000 \
         --rollout-server rollout-server-0.${SKYPILOT_JOBGROUP_NAME}:8001 \
-        --reward-server reward-server-0.${SKYPILOT_JOBGROUP_NAME}:8002
+        --reward-server reward-server-0.${SKYPILOT_JOBGROUP_NAME}:8002 \
+        --policy-sync-path /shared/policy/latest
 
-See the full RL post-training example at ``llm/rl-post-training-jobgroup/`` in the SkyPilot repository.
+.. figure:: ../images/job-groups-dashboard.png
+   :width: 100%
+   :align: center
+   :alt: Job Groups in SkyPilot Dashboard
+
+   The same Job Group running in production, viewed from the SkyPilot dashboard.
+   Each task has independent resources and can be monitored separately.
+
+See the `full RL post-training example <https://github.com/skypilot-org/skypilot/tree/master/llm/rl-post-training-jobgroup>`_ in the SkyPilot repository.
 
 Primary and auxiliary tasks
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -319,6 +388,103 @@ complete:
 When the trainer task finishes, the data-server (auxiliary) task will receive a
 termination signal after the 30-second delay, allowing it to flush pending data
 or perform cleanup.
+
+.. _job-groups-dynamic-members:
+
+Launching jobs from inside a job group
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A task in a job group can launch further managed jobs with ``sky jobs launch``
+or :func:`sky.jobs.launch` (see :ref:`nested-skypilot-managed-jobs`). A job
+launched this way becomes a *dynamic task* of the group:
+
+- It is listed under the group in ``sky jobs queue`` and the dashboard,
+  numbered on from the group's current tasks (a group with tasks 0 and 1
+  shows its first launched job as task 2). It is addressed like the group's
+  other tasks: ``sky jobs logs 39 2`` tails it and ``sky jobs cancel 39 --task 2``
+  cancels it on its own. Underneath, it is a managed job of its own.
+- ``sky jobs cancel <group>`` cancels it together with the group.
+- When the group finishes, dynamic tasks still running are cancelled. A group
+  finishes once all its primary tasks have finished and its auxiliary tasks
+  have been terminated (after their ``termination_delay``), so a dynamic task
+  launched by an auxiliary task keeps running through that delay.
+- Its status is its own. A failed dynamic task does not fail the group, and a
+  dynamic task finishing does not affect the group.
+
+One use case for dynamic tasks is an eval watcher: one task watches for new
+checkpoints and launches one evaluation job per checkpoint, each on its own
+resources, while the trainer keeps training.
+
+.. code-block:: yaml
+
+    ---
+    name: train-and-eval
+    execution: parallel
+    primary_tasks: [trainer, eval-watcher]
+    ---
+    name: trainer
+    resources:
+      accelerators: H100:8
+    run: |
+      python train.py --checkpoint-dir /checkpoints
+    ---
+    name: eval-watcher
+    resources:
+      cpus: 2
+    run: |
+      # The SkyPilot client installed on every node (under $HOME on
+      # Kubernetes, $SKY_RUNTIME_DIR on Slurm); the task's credentials point
+      # it at the API server.
+      source "${SKY_RUNTIME_DIR:-$HOME}/skypilot-runtime/bin/activate"
+      # One eval job per new checkpoint. Each is a dynamic task of this group:
+      # listed under it in `sky jobs queue`, cancelled with it.
+      for ckpt in $(python watch_checkpoints.py /checkpoints); do
+        sky jobs launch -y -d -n "eval-$ckpt" eval.yaml --env CKPT=$ckpt
+      done
+      # Wait for the evals before exiting: the group finishes when both
+      # primaries have, and an eval still running then would be cancelled.
+      python wait_for_evals.py
+
+The watcher is a primary task so that the group stays alive until the last
+evaluation it launched has finished. As an auxiliary task it would instead be
+terminated once the trainer finished, after the group's ``termination_delay``,
+and its evaluations would be cancelled with it. A runnable version is in the
+`Job Group SDK examples <https://github.com/skypilot-org/skypilot/tree/master/examples/job-group-sdk>`_.
+
+The queue shows the dynamic tasks under the group as tasks 2 and 3:
+
+.. code-block:: console
+
+    $ sky jobs queue
+    ID    TASK  NAME              ...  STATUS
+    42    -     train-and-eval    ...  RUNNING
+     ↳    0     trainer [P]       ...  RUNNING
+     ↳    1     eval-watcher [P]  ...  RUNNING
+     ↳    2     eval-step-1000    ...  SUCCEEDED
+     ↳    3     eval-step-2000    ...  RUNNING
+
+    $ sky jobs cancel 42 --task 3   # the second evaluation, on its own
+
+**Choosing the group.** A job launched from inside a job group attaches to that
+group by default. ``--job-group <job id or name>`` attaches to a running job
+group explicitly, from anywhere; ``--no-job-group`` launches a top-level job
+even from inside a group. In the SDK, :func:`sky.jobs.launch` takes
+``job_group``: ``sky.jobs.AUTO_JOB_GROUP`` (the default), a job id or unique
+running job name, or ``None`` for a top-level job.
+
+.. note::
+
+   Attaching to a job group requires a :ref:`remote SkyPilot API server
+   <sky-api-server>` running managed jobs in :ref:`consolidation mode
+   <jobs-consolidation-mode>`, and :ref:`API server access from within the
+   job <nested-skypilot-managed-jobs>` for the launching task. Elsewhere,
+   ``--job-group`` is rejected and a launch from inside a group runs as a
+   top-level job.
+
+Members do not take part in the group's :ref:`service discovery
+<job-groups-service-discovery>` (they are not reachable by group hostname and
+do not get one), are scheduled independently of the group, and have no
+``termination_delay`` of their own.
 
 Using the Python SDK
 ~~~~~~~~~~~~~~~~~~~~

@@ -45,6 +45,7 @@ class ManagedJobRunner(Protocol):
         workspace_match: Optional[str],
         name_match: Optional[str],
         pool_match: Optional[str],
+        infra_match: Optional[str],
         page: Optional[int],
         limit: Optional[int],
         user_hashes: Optional[List[Optional[str]]],
@@ -52,9 +53,11 @@ class ManagedJobRunner(Protocol):
         fields: Optional[List[str]],
         sort_by: Optional[str],
         sort_order: Optional[str],
+        submitted_after: Optional[float],
+        submitted_before: Optional[float],
     ) -> Tuple[List[Dict[str, Any]], int,
-               'managed_job_utils.ManagedJobQueueResultType', int, Dict[str,
-                                                                        int]]:
+               'managed_job_utils.ManagedJobQueueResultType', int, Dict[
+                   str, int], List[str]]:
         ...
 
     def cancel_managed_jobs(
@@ -72,6 +75,40 @@ class ManagedJobRunner(Protocol):
     ) -> str:
         ...
 
+    def events(
+        self,
+        *,
+        job_id: int,
+        task_id: Optional[int],
+        task: Optional[Union[str, int]],
+        limit: Optional[int],
+        include_cluster_events: bool,
+    ) -> List[Dict[str, Any]]:
+        """The status-transition timeline of a managed job, newest first.
+
+        Rows are dicts with ``spot_job_id``, ``task_id``, ``new_status``,
+        ``code``, ``reason`` and ``timestamp``.
+
+        Unlike the other methods here this one takes no ``handle`` or
+        ``backend``: the answer comes from the jobs database and from the
+        cluster's own events, and nothing is asked of the controller. The
+        extension point exists so a runner can add what the infrastructure
+        knows about the same job -- on Slurm, what the allocation waited on
+        and for how long -- which the default implementation cannot read.
+
+        ``include_cluster_events`` merges the underlying cluster's
+        launch-progress events into the timeline; ``limit`` caps the merged
+        result at exactly that many of the most recent rows.
+
+        Reading state directly rather than asking the controller -- which is
+        what ``queue`` does -- is what the ``/jobs/events`` endpoint has
+        always done, and is left unchanged here: it is the API server's own
+        ``spot_jobs`` and ``global_user_state`` that are read, so the answer
+        is complete wherever the controller shares them (consolidation mode,
+        or a shared database). This seam exists to *add* to that answer, not
+        to move where it comes from.
+        """
+
     def tail_managed_job_logs(
         self,
         *,
@@ -82,6 +119,7 @@ class ManagedJobRunner(Protocol):
         follow: bool,
         controller: bool,
         tail: Optional[int],
+        tail_offset: Optional[int] = None,
         task: Optional[Union[str, int]],
     ) -> int:
         ...

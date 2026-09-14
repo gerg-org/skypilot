@@ -1,15 +1,38 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { showToast } from '@/data/connectors/toast';
 import {
+  API_VERSION_HEADER,
+  CLIENT_API_VERSION,
+  CLIENT_VERSION,
   CLUSTER_NOT_UP_ERROR,
   CLUSTER_DOES_NOT_EXIST,
   NOT_SUPPORTED_ERROR,
+  ENDPOINT,
+  VERSION_HEADER,
 } from '@/data/connectors/constants';
 import dashboardCache from '@/lib/cache';
 import jobsCacheManager from '@/lib/jobs-cache-manager';
 import { apiClient } from './client';
 import { trackJobAction } from '@/lib/analytics';
 import { applyEnhancements } from '@/plugins/dataEnhancement';
+
+/**
+ * Tooltip for a job's status badge: pending reason for PENDING jobs, the
+ * failure details (which carry the failure attribution and exit code,
+ * e.g. "Job exited with exit code 7 (user program failure). ...") for
+ * FAILED* jobs, and who requested the cancellation (e.g. "Cancellation
+ * requested by user alice (request ID: ...)") for CANCELLING/CANCELLED
+ * jobs. Same text as the details column, surfaced on hover.
+ */
+function getStatusTooltip(job) {
+  if (job.status === 'PENDING' || job.status?.startsWith('FAILED')) {
+    return job.details || job.failure_reason || null;
+  }
+  if (job.status === 'CANCELLING' || job.status === 'CANCELLED') {
+    return job.details || null;
+  }
+  return null;
+}
 
 // ============ Pagination Plugin Integration ============
 
@@ -67,6 +90,11 @@ const DEFAULT_FIELDS = [
   'batch_completed_batches',
   'node_names',
   'priority_class',
+  // Where a job launched from inside another managed job sits in its tree.
+  'root_job_id',
+  'parent_job_id',
+  'parent_task_id',
+  'dynamic_task_index',
 ];
 
 /**
@@ -122,6 +150,7 @@ export async function getManagedJobs(options = {}) {
       userMatch,
       workspaceMatch,
       poolMatch,
+      infraMatch,
       page,
       limit,
       statuses,
@@ -138,6 +167,7 @@ export async function getManagedJobs(options = {}) {
     if (userMatch !== undefined) body.user_match = userMatch;
     if (workspaceMatch !== undefined) body.workspace_match = workspaceMatch;
     if (poolMatch !== undefined) body.pool_match = poolMatch;
+    if (infraMatch !== undefined) body.infra_match = infraMatch;
     if (page !== undefined) body.page = page;
     if (limit !== undefined) body.limit = limit;
     if (statuses !== undefined && statuses.length > 0) body.statuses = statuses;
@@ -166,6 +196,9 @@ export async function getManagedJobs(options = {}) {
     }
     const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
     let errorMessage = fetchedData.statusText;
+    // Recorded rather than thrown from inside the parse below: a throw there
+    // lands in that block's own catch and is reported as a parse failure.
+    let infraFilterUnsupported = null;
     if (fetchedData.status === 500) {
       try {
         const data = await fetchedData.json();
@@ -175,6 +208,16 @@ export async function getManagedJobs(options = {}) {
             // Handle specific error types
             if (error.type && error.type === CLUSTER_NOT_UP_ERROR) {
               return { jobs: [], total: 0, controllerStopped: true };
+            } else if (
+              error.type === NOT_SUPPORTED_ERROR &&
+              infraMatch !== undefined
+            ) {
+              // Only the infra filter can be refused here, and only by a
+              // controller too old to apply it. Carry that out so the page can
+              // say so, rather than fall back to an unfiltered table -- which
+              // is the one thing this filter must never show.
+              infraFilterUnsupported =
+                error.message || 'Filtering by infra is not supported.';
             } else {
               errorMessage = error.message || String(data.detail.error);
             }
@@ -191,6 +234,11 @@ export async function getManagedJobs(options = {}) {
         errorMessage = String(parseError);
       }
     }
+    if (infraFilterUnsupported) {
+      const unsupported = new Error(infraFilterUnsupported);
+      unsupported.infraFilterUnsupported = true;
+      throw unsupported;
+    }
     // Handle all error status codes (4xx, 5xx, etc.)
     if (!fetchedData.ok) {
       const msg = `API request to get managed jobs result failed with status ${fetchedData.status}, error: ${errorMessage}`;
@@ -205,6 +253,11 @@ export async function getManagedJobs(options = {}) {
       : (parsed?.total ?? managedJobs.length);
     const totalNoFilter = parsed?.total_no_filter || total;
     const statusCounts = parsed?.status_counts || {};
+    // The distinct `--infra` specs across everything the other filters select,
+    // computed server-side because the queue is paginated. Absent from a server
+    // or jobs controller that predates the field, in which case the page falls
+    // back to deriving the options from the rows it has.
+    const infraOptions = parsed?.infra_options || [];
 
     // Process jobs data
     const jobData = managedJobs.map((job) => {
@@ -283,15 +336,23 @@ export async function getManagedJobs(options = {}) {
         resources_str_full: job.cluster_resources_full || cluster_resources,
         cloud: cloud,
         region: job.region,
+        // Zone; for Slurm this is the partition the job was scheduled to.
+        zone: job.zone && job.zone !== '-' ? job.zone : null,
         infra: infra,
         full_infra: full_infra,
         recoveries: job.recovery_count,
         details: job.details || job.failure_reason,
+        // Mirror the cluster INIT tooltip: surface the pending reason on
+        // the status badge so users can see why a job is stuck in PENDING,
+        // and the failure attribution (user program vs SkyPilot/infra) on
+        // FAILED* badges, without opening the job details view.
+        statusTooltip: getStatusTooltip(job),
         user: job.user_name,
         user_hash: job.user_hash,
         submitted_at: job.submitted_at
           ? new Date(job.submitted_at * 1000)
           : null,
+        started_at: job.start_at ? new Date(job.start_at * 1000) : null,
         events: events,
         dag_yaml: job.user_yaml,
         entrypoint: job.entrypoint,
@@ -310,6 +371,15 @@ export async function getManagedJobs(options = {}) {
         is_job_group: job.is_job_group,
         execution: job.execution,
         is_primary_in_job_group: job.is_primary_in_job_group,
+        // Job tree fields, null for a top-level job: root_job_id is the
+        // top-level job of the tree, parent_job_id/parent_task_id the job
+        // and task that launched this one.
+        root_job_id: job.root_job_id ?? null,
+        parent_job_id: job.parent_job_id ?? null,
+        parent_task_id: job.parent_task_id ?? null,
+        // A dynamic task's ordinal within its root's tree (declared tasks are
+        // 0..n-1, dynamic tasks number on); `<root>-<index>` names it.
+        dynamic_task_index: job.dynamic_task_index ?? null,
         // Batch progress
         batch_total_batches: job.batch_total_batches,
         batch_completed_batches: job.batch_completed_batches,
@@ -329,6 +399,7 @@ export async function getManagedJobs(options = {}) {
       totalNoFilter,
       controllerStopped: false,
       statusCounts,
+      infraOptions,
     };
   } catch (error) {
     console.error('Error fetching managed job data:', error);
@@ -466,6 +537,12 @@ export async function getPoolStatus() {
     const data = await fetchedData.json();
     const poolData = data.return_value ? JSON.parse(data.return_value) : [];
 
+    // Skip the active-jobs fetch entirely when there are no pools — the
+    // job counts it computes have nothing to attach to.
+    if (poolData.length === 0) {
+      return { pools: [], controllerStopped: false };
+    }
+
     // Also fetch managed jobs to get job counts by pool
     let jobsData = { jobs: [] };
     try {
@@ -514,6 +591,11 @@ export async function getPoolStatus() {
     const pools = poolData.map((pool) => ({
       ...pool,
       jobCounts: jobCountsByPool[pool.name] || {},
+      // Normalize the owning user onto the same `user`/`user_hash` shape the
+      // clusters and jobs tables use, so the shared UserDisplay/filtering
+      // helpers work unchanged.
+      user: pool.user_name,
+      user_hash: pool.user_hash,
     }));
 
     return { pools, controllerStopped: false };
@@ -528,6 +610,9 @@ export async function getPoolStatus() {
 export function useSingleManagedJob(jobId, refreshTrigger = 0) {
   const [jobData, setJobData] = useState(null);
   const [loadingJobData, setLoadingJobData] = useState(true);
+  // Track the last seen refresh trigger so we only invalidate the cache when
+  // it actually increments (a manual refresh), not on every effect run.
+  const prevRefreshTriggerRef = useRef(refreshTrigger);
 
   const loading = loadingJobData;
 
@@ -538,10 +623,21 @@ export function useSingleManagedJob(jobId, refreshTrigger = 0) {
       try {
         setLoadingJobData(true);
 
-        // Fetch the specific job by ID with all fields for complete data
-        const allJobsData = await dashboardCache.get(getManagedJobs, [
+        // Fetch the specific job by ID with all fields for complete data.
+        const cacheArgs = [
           { allUsers: true, allFields: true, jobIDs: [jobId] },
-        ]);
+        ];
+        // Drop the cached entry only when the refresh trigger actually
+        // increments (a manual refresh), so the click fetches fresh data.
+        // Guarding on `> 0` instead would also invalidate the new job's
+        // cache when navigating between jobs while the trigger stays elevated
+        // (the parent keeps refreshTrigger state across jobId changes),
+        // defeating the cache on initial load.
+        if (refreshTrigger > prevRefreshTriggerRef.current) {
+          dashboardCache.invalidate(getManagedJobs, cacheArgs);
+        }
+        prevRefreshTriggerRef.current = refreshTrigger;
+        const allJobsData = await dashboardCache.get(getManagedJobs, cacheArgs);
 
         // Filter for ALL tasks matching this job_id (supports multi-task jobs)
         const matchingJobs =
@@ -572,6 +668,81 @@ export function useSingleManagedJob(jobId, refreshTrigger = 0) {
   }, [jobId, refreshTrigger]);
 
   return { jobData, loading };
+}
+
+// Fields needed to list the jobs launched under a job on its detail page.
+const JOB_TREE_MEMBER_FIELDS = [
+  'job_id',
+  '_job_id',
+  'job_name',
+  'task_name',
+  'status',
+  'job_duration',
+  'submitted_at',
+  'user_name',
+  'resources',
+  'cloud',
+  'region',
+  'accelerators',
+  'cluster_resources',
+  'cluster_resources_full',
+  'recovery_count',
+  // A launched job can itself be a job group: its status is aggregated
+  // over its primary tasks, like its own detail page does.
+  'is_primary_in_job_group',
+  'root_job_id',
+  'parent_job_id',
+  'parent_task_id',
+  'dynamic_task_index',
+];
+
+/**
+ * Rows of every job launched from inside the job `jobId`, directly or
+ * through another launched job: the jobs whose root_job_id is jobId. Empty
+ * for a job that is not the top-level job of a tree. The queue API has no
+ * filter on root_job_id, so this reads the cached listing with a minimal
+ * field set and filters client-side, like the pool job counts do.
+ */
+export function useJobTreeMembers(jobId, refreshTrigger = 0) {
+  const [members, setMembers] = useState([]);
+  // `loaded` lets a page tell "no members" apart from "not fetched yet".
+  const [loaded, setLoaded] = useState(false);
+  const prevRefreshTriggerRef = useRef(refreshTrigger);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function fetchMembers() {
+      if (!jobId) return;
+      const cacheArgs = [{ allUsers: true, fields: JOB_TREE_MEMBER_FIELDS }];
+      // Same refresh handling as useSingleManagedJob: drop the cached
+      // entry only when the trigger actually increments.
+      if (refreshTrigger > prevRefreshTriggerRef.current) {
+        dashboardCache.invalidate(getManagedJobs, cacheArgs);
+      }
+      prevRefreshTriggerRef.current = refreshTrigger;
+      try {
+        const data = await dashboardCache.get(getManagedJobs, cacheArgs);
+        if (cancelled) return;
+        setMembers(
+          data?.jobs?.filter(
+            (j) =>
+              j.root_job_id != null && String(j.root_job_id) === String(jobId)
+          ) || []
+        );
+      } catch (error) {
+        console.error('Error fetching jobs launched from job:', error);
+        if (!cancelled) setMembers([]);
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    }
+    fetchMembers();
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, refreshTrigger]);
+
+  return { members, loaded };
 }
 
 export async function streamManagedJobLogs({
@@ -825,30 +996,115 @@ export async function handleJobAction(action, jobId, cluster) {
 /**
  * Downloads managed job logs as a zip via the API server.
  * Flow:
- * 1) POST /jobs/download_logs to fetch logs from the remote cluster to API server
- * 2) POST /download to stream a zip back to the browser and trigger download
+ * 1) POST /jobs/download_logs - copy logs from cluster to API server tmp dir
+ * 2) POST /download - server zips and streams it back as a binary response
+ * 3) Save the response blob via `<a download>` (createObjectURL).
  */
+// Long-poll /jobs/download_logs by hand instead of using apiClient.fetch.
+// For multi-GB running jobs sync_down can take 5+ minutes — well past
+// the ~100s edge timeouts (Cloudflare 524 etc.) of a single GET.
+// Retry the polling GET when we hit a 5xx so the user-visible request
+// resumes waiting on the SAME server-side request_id until it
+// completes. (sync_down already passes follow=False, so the underlying
+// stream_logs reads to EOF and exits — it just takes a while.)
+async function downloadLogsWithRetry(body, maxAttempts = 30) {
+  // Step 1: dispatch the request and grab its server-side ID.
+  const baseUrl = window.location.origin;
+  const userInfo = await (async () => {
+    // Mirror what apiClient.fetch does — the env_vars path matters.
+    const r = await fetch(`${baseUrl}/internal/dashboard/users/role`).catch(
+      () => null
+    );
+    if (r && r.ok) return r.json();
+    return { id: 'local', name: 'local' };
+  })();
+  const dispatch = await fetch(`${baseUrl}${ENDPOINT}/jobs/download_logs`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      // /jobs/download_logs is a queued (executor.schedule_request_async)
+      // route, so the worker-side gate honors this header to pick up
+      // the resolver path — without it, users without 'default'
+      // workspace access would be rejected at
+      // reject_request_for_unauthorized_workspace. Both
+      // API_VERSION_HEADER and VERSION_HEADER are required — the server
+      // middleware drops the ContextVar write if either is missing.
+      [API_VERSION_HEADER]: CLIENT_API_VERSION,
+      [VERSION_HEADER]: CLIENT_VERSION,
+    },
+    body: JSON.stringify({
+      ...body,
+      env_vars: {
+        SKYPILOT_IS_FROM_DASHBOARD: 'true',
+        SKYPILOT_USER_ID: userInfo.id,
+        SKYPILOT_USER: userInfo.name,
+      },
+    }),
+  });
+  if (!dispatch.ok) {
+    throw new Error(`download_logs dispatch failed: ${dispatch.status}`);
+  }
+  const requestId = dispatch.headers.get('X-Skypilot-Request-ID');
+  if (!requestId) {
+    throw new Error('download_logs dispatch missing X-Skypilot-Request-ID');
+  }
+
+  // Step 2: long-poll /api/get, retrying on edge-timeout responses.
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const r = await fetch(
+      `${baseUrl}${ENDPOINT}/api/get?request_id=${requestId}`
+    );
+    // 524 Cloudflare timeout / 502/503/504 transient — retry against
+    // the same request_id; the server's long-poll resumes waiting.
+    if (
+      r.status === 524 ||
+      r.status === 502 ||
+      r.status === 503 ||
+      r.status === 504
+    ) {
+      // Linear backoff capped at 5s. Cloudflare 524 self-paces at
+      // ~100s so most attempts gain nothing, but a server-side 502/503
+      // hiccup would otherwise hammer the API server back-to-back.
+      const backoffMs = Math.min(1000 * (attempt + 1), 5000);
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      continue;
+    }
+    if (!r.ok) {
+      const text = await r.text();
+      throw new Error(`/api/get ${r.status}: ${text}`);
+    }
+    const data = await r.json();
+    return data.return_value ? JSON.parse(data.return_value) : [];
+  }
+  throw new Error('download_logs timed out after retries');
+}
+
+// Prepare a zip via sync_down + /download, read the response as a
+// blob, and save via createObjectURL. The wait scales with rsync time
+// on the worker, so multi-GB running logs can take a few minutes —
+// downloadLogsWithRetry tolerates Cloudflare 524 during that window.
 export async function downloadManagedJobLogs({
   jobId = null,
   name = null,
   controller = false,
 }) {
   try {
-    // Step 1: schedule server-side download; result is a mapping job_id -> folder path on API server
-    const mapping = await apiClient.fetch('/jobs/download_logs', {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const namePart = jobId ? `job-${jobId}` : name ? `job-${name}` : 'job';
+    const logType = controller ? 'controller-logs' : 'logs';
+    const filename = `managed-${namePart}-${logType}-${ts}.zip`;
+
+    const mapping = await downloadLogsWithRetry({
       job_id: jobId,
       name: name,
       controller: controller,
       refresh: false,
     });
-
     const folderPaths = Object.values(mapping || {});
     if (!folderPaths.length) {
       showToast('No logs found to download.', 'warning');
       return;
     }
-
-    // Step 2: request the zip and trigger browser download
     const resp = await apiClient.fetchImmediate('/download?relative=items', {
       folder_paths: folderPaths,
     });
@@ -859,10 +1115,6 @@ export async function downloadManagedJobLogs({
     const blob = await resp.blob();
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
-    const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    const namePart = jobId ? `job-${jobId}` : name ? `job-${name}` : 'job';
-    const logType = controller ? 'controller-logs' : 'logs';
-    const filename = `managed-${namePart}-${logType}-${ts}.zip`;
     a.href = url;
     a.download = filename;
     document.body.appendChild(a);

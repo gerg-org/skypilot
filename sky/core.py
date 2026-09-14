@@ -1,5 +1,6 @@
 """SDK functions for cluster/job management."""
 import concurrent.futures
+import json
 import shlex
 import typing
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -38,12 +39,14 @@ from sky.utils import common
 from sky.utils import common_utils
 from sky.utils import controller_utils
 from sky.utils import debug_utils
+from sky.utils import log_links
 from sky.utils import resources_utils
 from sky.utils import rich_utils
 from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 from sky.utils.kubernetes import kubernetes_deploy_utils
+from sky.workspaces import constants as workspace_constants
 from sky.workspaces import core as workspaces_core
 
 if typing.TYPE_CHECKING:
@@ -339,7 +342,10 @@ def get_cluster_events(
             is specified.
         cluster_hash: Hash of the cluster. Cannot be specified if cluster_name
             is specified.
-        event_type: Type of events to retrieve ('STATUS_CHANGE' or 'DEBUG').
+        event_type: Type of events to retrieve (e.g. 'STATUS_CHANGE' or
+            'DEBUG'). Multiple types may be requested as a comma-separated
+            string (e.g. 'STATUS_CHANGE,LAUNCH_PROGRESS'); the results are
+            merged and ordered by timestamp.
         include_timestamps: If True, returns list of dicts with 'reason' and
             'transitioned_at' fields. If False, returns list of reason strings.
         limit: If specified, returns at most this many events (most recent).
@@ -351,11 +357,19 @@ def get_cluster_events(
             'transitioned_at' (unix timestamp) fields.
         Events are ordered from oldest to newest.
     """
-    event_type_enum = global_user_state.ClusterEventType(event_type)
+    event_type_enums = [
+        global_user_state.ClusterEventType(event_type_str.strip())
+        for event_type_str in event_type.split(',')
+        if event_type_str.strip()
+    ]
+    if not event_type_enums:
+        # Reject blank/empty input rather than silently matching nothing
+        # (an empty type list translates to `type IN ()`, i.e. no events).
+        raise ValueError(f'No valid cluster event type in {event_type!r}.')
     return global_user_state.get_cluster_events(
         cluster_name=cluster_name,
         cluster_hash=cluster_hash,
-        event_type=event_type_enum,
+        event_type=event_type_enums,
         include_timestamps=include_timestamps,
         limit=limit)
 
@@ -385,10 +399,11 @@ def endpoints(cluster: str,
 
 
 @usage_lib.entrypoint
-def cost_report(
-        days: Optional[int] = None,
-        dashboard_summary_response: bool = False,
-        cluster_hashes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def cost_report(days: Optional[int] = None,
+                dashboard_summary_response: bool = False,
+                cluster_hashes: Optional[List[str]] = None,
+                cluster_names: Optional[List[str]] = None,
+                exclude_managed_clusters: bool = False) -> List[Dict[str, Any]]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Get all cluster cost reports, including those that have been downed.
 
@@ -426,6 +441,21 @@ def cost_report(
         days: Number of days to look back from now. Active clusters are always
             included. Historical clusters are only included if they were last
             used within the past 'days' days. Defaults to 30 days.
+        dashboard_summary_response: If True, return an abbreviated payload
+            suitable for dashboard list views. Has no effect when
+            cluster_hashes or cluster_names is provided (filtered queries
+            always return the full record).
+        cluster_hashes: If provided, only include clusters whose hash is in
+            this list.
+        cluster_names: If provided, only include clusters whose name is in
+            this list. When both cluster_hashes and cluster_names are
+            provided, rows matching either are returned (logical OR). Note
+            that a single cluster name may map to multiple history records
+            when the name is reused across launches.
+        exclude_managed_clusters: If True, exclude clusters launched by a
+            controller (managed jobs and services). Used by the dashboard so
+            that clusters backing managed jobs do not show up in the cluster
+            history view.
 
     Returns:
         A list of dicts, with each dict containing the cost information of a
@@ -434,12 +464,15 @@ def cost_report(
     if days is None:
         days = constants.COST_REPORT_DEFAULT_DAYS
 
-    abbreviate_response = dashboard_summary_response and cluster_hashes is None
+    abbreviate_response = (dashboard_summary_response and
+                           cluster_hashes is None and cluster_names is None)
 
     cluster_reports = global_user_state.get_clusters_from_history(
         days=days,
         abbreviate_response=abbreviate_response,
-        cluster_hashes=cluster_hashes)
+        cluster_hashes=cluster_hashes,
+        cluster_names=cluster_names,
+        exclude_managed_clusters=exclude_managed_clusters)
     logger.debug(
         f'{len(cluster_reports)} clusters found from history with {days} days.')
 
@@ -577,15 +610,40 @@ def _start(
         controller_resources = controller_utils.get_controller_resources(
             controller, [])
         # All resources should have the same autostop config.
-        controller_autostop_config = list(
-            controller_resources)[0].autostop_config
+        controller_resource = list(controller_resources)[0]
+        controller_autostop_config = controller_resource.autostop_config
         if (controller_autostop_config is not None and
                 controller_autostop_config.enabled):
             idle_minutes_to_autostop = controller_autostop_config.idle_minutes
             down = controller_autostop_config.down
             wait_for = controller_autostop_config.wait_for
-            hook = controller_autostop_config.hook
-            hook_timeout = controller_autostop_config.hook_timeout
+            # `controller_resource.hooks` is populated only when the user
+            # wrote the legacy `autostop.hook` field under
+            # `*.controller.resources` in ~/.sky/config.yaml (master-compat
+            # surface — the new `hooks:` form is rejected at schema time
+            # by _get_controller_schema). Resources.from_yaml_config
+            # routes the legacy field into _hooks with events=[stop] or
+            # events=[down] depending on autostop.down.
+            #
+            # Pull it back out into the pre-v7 wire fields
+            # (`hook` / `hook_timeout`) so non-consolidated controllers
+            # running an older skylet (< SKYLET_LIB_VERSION 7) — i.e.
+            # controllers that haven't been re-launched since the client
+            # upgrade — still receive the hook via the legacy
+            # SetAutostop fields. AutostopCodeGen.set_autostop dual-emits
+            # both `hook` and `hooks`, so v7+ skylets get it via either
+            # path; this loop only matters for the v<7 case.
+            #
+            # TODO(zpoint): remove after v0.15.0 — aligned with the
+            # autostop.hook removal already pinned at v0.15.0 in
+            # sky/utils/schemas.py:_AUTOSTOP_SCHEMA.
+            legacy_event = ('down'
+                            if controller_autostop_config.down else 'stop')
+            for entry in (controller_resource.hooks or []):
+                if legacy_event in entry.get('events', []):
+                    hook = entry['run']
+                    hook_timeout = entry.get('timeout')
+                    break
     else:
         # For non-controller clusters, restore autostop configuration from
         # database if not explicitly provided.
@@ -634,12 +692,19 @@ def _start(
         # For controller clusters, hook comes from controller_autostop_config.
         # For regular clusters, hook is None so it will be inherited from the
         # existing config on the remote cluster.
+        hooks_list: Optional[List[Dict[str, Any]]] = None
+        if controller is not None and controller_resources:
+            # pylint: disable=unsubscriptable-object
+            hooks_list = list(controller_resources)[0].hooks
+        elif handle.launched_resources is not None:
+            hooks_list = handle.launched_resources.hooks
         backend.set_autostop(handle,
                              idle_minutes_to_autostop,
                              wait_for,
                              down,
                              hook=hook,
-                             hook_timeout=hook_timeout)
+                             hook_timeout=hook_timeout,
+                             hooks=hooks_list)
     return handle
 
 
@@ -753,7 +818,16 @@ def _graceful_job_cancel(handle: backends.ResourceHandle,
     if timeout:
         flush_script = f'timeout {timeout} bash -c {shlex.quote(flush_script)}'
 
-    runners = handle.get_command_runners()
+    try:
+        runners = handle.get_command_runners()
+    except Exception as e:  # pylint: disable=broad-except
+        # Not every provisioner can produce command runners (e.g. a runtime
+        # that offers no exec access into the instances). Skip the flush
+        # instead of propagating, so the caller can still tear the cluster
+        # down; otherwise its resources would be leaked.
+        logger.warning('Skipping MOUNT_CACHED upload flush on '
+                       f'{cluster_name!r}: failed to get command runners: {e}')
+        return
     node_args = [(i, runner) for i, runner in enumerate(runners)]
     errors = []
     logger.debug(f'Waiting for uploads on {len(runners)} node(s)...')
@@ -794,11 +868,34 @@ def _graceful_job_cancel(handle: backends.ResourceHandle,
         logger.debug(f'All MOUNT_CACHED uploads completed on {cluster_name!r}')
 
 
+def _user_action_event_reason(action: str) -> str:
+    """The cluster-event reason for a user-requested lifecycle action.
+
+    Names the requesting user and the API request that carried the action
+    when they are known, so the cluster's event log records who stopped or
+    terminated a cluster -- the attribution the managed-job event log keeps
+    for a cancellation. Falls back to the plain text when there is no request
+    context to name (an in-process caller).
+    """
+    actor = common_utils.get_current_request_actor()
+    if actor is None:
+        return f'Cluster was {action} by user.'
+    return f'Cluster was {action} by user {actor}.'
+
+
+def user_initiated_down(cluster_name: str,
+                        purge: bool = False,
+                        graceful: bool = False,
+                        graceful_timeout: Optional[int] = None) -> None:
+    down(cluster_name, purge, graceful, graceful_timeout, user_initiated=True)
+
+
 @usage_lib.entrypoint
 def down(cluster_name: str,
          purge: bool = False,
          graceful: bool = False,
-         graceful_timeout: Optional[int] = None) -> None:
+         graceful_timeout: Optional[int] = None,
+         user_initiated: bool = False) -> None:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Tears down a cluster.
 
@@ -830,6 +927,15 @@ def down(cluster_name: str,
     if handle is None:
         raise exceptions.ClusterDoesNotExist(
             f'Cluster {cluster_name!r} does not exist.')
+
+    if user_initiated:
+        # Record the event before teardown, while the cluster row still exists
+        # so its hash can be resolved (teardown deletes the row). There is no
+        # TERMINATED cluster status, so new_status is None.
+        global_user_state.add_cluster_event(
+            cluster_name, None, _user_action_event_reason('terminated'),
+            global_user_state.ClusterEventType.STATUS_CHANGE)
+
     backend = backend_utils.get_backend_from_handle(handle)
 
     if graceful:
@@ -840,7 +946,87 @@ def down(cluster_name: str,
                              terminate=True)
 
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
+    _maybe_run_down_hooks(handle, backend, cluster_name)
     backend.teardown(handle, terminate=True, purge=purge)
+
+
+def _maybe_run_teardown_hooks(handle: 'backends.ResourceHandle',
+                              backend: 'backends.Backend', cluster_name: str,
+                              event: str) -> None:
+    """Runs ``event`` lifecycle hooks on the head before teardown.
+
+    Handles both ``down`` (``sky down``) and ``stop`` (``sky stop``)
+    user-initiated teardowns. Best-effort: if the head is unreachable
+    or running the hooks fails, we log a warning and proceed with
+    teardown so users can never be stuck. Per-node exactly-once
+    semantics are enforced on the head via the CAS in
+    ``hook_executor.try_claim_teardown``.
+    """
+    # Only the VM/Ray backend is supported; other backends simply skip.
+    if not isinstance(backend, cloud_vm_ray_backend.CloudVmRayBackend):
+        return
+    # Skip the head SSH entirely when the cluster has NO hooks declared.
+    # The codegen exists to (a) run user-declared hooks and (b) claim
+    # the per-event teardown slot so a later SIGTERM cannot fire a
+    # competing preemption hook on what was an intentional teardown.
+    # With no hooks at all, both are no-ops — there's nothing to run
+    # and no preemption hook can race. SSH-ing the head anyway is pure
+    # overhead and surfaces a misleading ``Failed to run <event> hook
+    # on '<cluster>': . Proceeding with teardown.`` warning whenever
+    # the head IP is transiently unreachable (already partway shut
+    # down, stale cached handle, etc.) — for a user who never declared
+    # a hook in their YAML.
+    declared_hooks = getattr(getattr(handle, 'launched_resources', None),
+                             'hooks', None)
+    if not declared_hooks:
+        return
+    # Claim the event slot unconditionally — even if no hook declares
+    # this event. For 'down', the claim blocks the SIGTERM handler
+    # (kubelet's SIGTERM at K8s pod delete) from later claiming
+    # 'preemption' and firing the preemption hook on what was
+    # intentionally `sky down`. For 'stop', it blocks a racing
+    # idle-timer fire on the head. `hook_executor.run(event, hooks)`
+    # is a no-op when no matching hooks exist.
+    codegen = ('from sky.skylet import autostop_lib, hook_executor\n'
+               'hooks = autostop_lib.get_hooks() or []\n'
+               f'if hook_executor.try_claim_teardown({event!r}):\n'
+               f'    hook_executor.run({event!r}, hooks)\n')
+    # Use SKY_PYTHON_CMD so the codegen sees the sky/ installation on the
+    # remote — plain `python3` may point at a minimal system interpreter.
+    cmd = f'{constants.SKY_PYTHON_CMD} -c {shlex.quote(codegen)}'
+    try:
+        with rich_utils.safe_status(
+                ux_utils.spinner_message(
+                    f'Running {event} hook on {cluster_name!r}')):
+            backend.run_on_head(
+                handle,
+                cmd,
+                stream_logs=False,
+                require_outputs=False,
+            )
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(f'Failed to run {event} hook on {cluster_name!r}: {e}. '
+                       'Proceeding with teardown.')
+
+
+def _maybe_run_down_hooks(handle: 'backends.ResourceHandle',
+                          backend: 'backends.Backend',
+                          cluster_name: str) -> None:
+    """Runs ``down`` lifecycle hooks on the head before teardown."""
+    _maybe_run_teardown_hooks(handle, backend, cluster_name, event='down')
+
+
+def _maybe_run_stop_hooks(handle: 'backends.ResourceHandle',
+                          backend: 'backends.Backend',
+                          cluster_name: str) -> None:
+    """Runs ``stop`` lifecycle hooks on the head before stop.
+
+    Fires on user-initiated ``sky stop``. The idle-timer-driven stop
+    path (``events.StopEvent``) fires the ``stop`` event independently
+    on the head with no client involvement, so this codegen only runs
+    for the user-command path.
+    """
+    _maybe_run_teardown_hooks(handle, backend, cluster_name, event='stop')
 
 
 @usage_lib.entrypoint
@@ -889,7 +1075,7 @@ def stop(cluster_name: str,
 
     global_user_state.add_cluster_event(
         cluster_name, status_lib.ClusterStatus.STOPPED,
-        'Cluster was stopped by user.',
+        _user_action_event_reason('stopped'),
         global_user_state.ClusterEventType.STATUS_CHANGE)
 
     backend = backend_utils.get_backend_from_handle(handle)
@@ -919,6 +1105,7 @@ def stop(cluster_name: str,
                              terminate=False)
 
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
+    _maybe_run_stop_hooks(handle, backend, cluster_name)
     backend.teardown(handle, terminate=False, purge=purge)
 
 
@@ -968,7 +1155,7 @@ def autostop(
           The script runs before the cluster is stopped or torn down. If the
           hook fails, autostop will still proceed but a warning will be logged.
         hook_timeout: timeout in seconds for hook execution. If None, uses
-          DEFAULT_AUTOSTOP_HOOK_TIMEOUT_SECONDS (3600 = 1 hour). The hook will
+          DEFAULT_HOOK_TIMEOUT_SECONDS (3600 = 1 hour). The hook will
           be terminated if it exceeds this timeout.
 
     Raises:
@@ -1025,17 +1212,35 @@ def autostop(
                 f'see reason above.') from e
 
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
+    hooks_list = (handle.launched_resources.hooks
+                  if handle.launched_resources is not None else None)
     backend.set_autostop(handle,
                          idle_minutes,
                          wait_for,
                          down,
                          hook=hook,
-                         hook_timeout=hook_timeout)
+                         hook_timeout=hook_timeout,
+                         hooks=hooks_list)
 
 
 # ==================
 # = Job Management =
 # ==================
+
+
+def _annotate_job_links(jobs: List[Dict[str, Any]]) -> None:
+    """Compute each job's external links from its harvested-URL metadata.
+
+    Matching against the configured dashboard.external_links patterns happens
+    here, server-side, in one place. URLs are harvested into job metadata by the
+    cluster's skylet, so a link is surfaced even if no one streamed the logs.
+    """
+    patterns = log_links.get_patterns()
+    for job in jobs:
+        meta = job.get('metadata') or {}
+        urls = meta.get(log_links.EXTRACTED_URLS_METADATA_KEY)
+        job['links'] = (log_links.match_links(urls, patterns)
+                        if patterns and isinstance(urls, list) else {})
 
 
 def _get_job_queue(handle: backends.CloudVmRayResourceHandle,
@@ -1065,11 +1270,14 @@ def _get_job_queue(handle: backends.CloudVmRayResourceHandle,
                     'resources': job_info.resources,
                     'log_path': job_info.log_path,
                     'user_hash': job_info.username,
+                    'metadata': (json.loads(job_info.metadata)
+                                 if job_info.metadata else {}),
                 }
                 # Copied from job_lib.load_job_queue.
                 user = global_user_state.get_user(job_dict['user_hash'])
                 job_dict['username'] = user.name if user is not None else None
                 jobs.append(job_dict)
+            _annotate_job_links(jobs)
             return jobs
         except exceptions.SKYLET_GRPC_FALLBACK_ERRORS as e:
             logger.debug(f'gRPC failed, falling back to SSH: {e}')
@@ -1086,7 +1294,9 @@ def _get_job_queue(handle: backends.CloudVmRayResourceHandle,
         f'{handle.cluster_name}.',
         stderr=f'{jobs_payload + stderr}',
         stream_logs=True)
-    return job_lib.load_job_queue(jobs_payload)
+    jobs = job_lib.load_job_queue(jobs_payload)
+    _annotate_job_links(jobs)
+    return jobs
 
 
 @usage_lib.entrypoint
@@ -1267,10 +1477,24 @@ def tail_logs(cluster_name: str,
 
     """
     # Check the status of the cluster.
-    handle = backend_utils.check_cluster_available(
-        cluster_name,
-        operation='tailing logs',
-    )
+    try:
+        handle = backend_utils.check_cluster_available(
+            cluster_name,
+            operation='tailing logs',
+        )
+    except (exceptions.ClusterNotUpError, exceptions.ClusterDoesNotExist):
+        # The cluster is gone; if a log reader is registered, stream the logs
+        # back from the external store instead.
+        from sky import logs  # pylint: disable=import-outside-toplevel
+        reader = logs.get_log_reader()
+        if reader is not None:
+            returncode = reader.read_cluster_job_logs(cluster_name,
+                                                      job_id,
+                                                      follow=follow,
+                                                      tail=tail)
+            if returncode is not None:
+                return returncode
+        raise
     backend = backend_utils.get_backend_from_handle(handle)
 
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
@@ -1283,13 +1507,16 @@ def tail_logs(cluster_name: str,
 
 
 @usage_lib.entrypoint
-def tail_autostop_logs(cluster_name: str,
-                       follow: bool = True,
-                       tail: int = 0) -> int:
-    """Tails the autostop hook logs of a cluster.
+def tail_hook_logs(cluster_name: str,
+                   event: Optional[str] = None,
+                   follow: bool = True,
+                   tail: int = 0) -> int:
+    """Tails per-event lifecycle-hook logs of a cluster.
 
     Args:
         cluster_name: name of the cluster.
+        event: one of 'stop', 'preemption', 'down'. When ``None``,
+            auto-selects whichever hook log exists on the cluster.
         follow: whether to follow the logs.
         tail: number of lines to display from the end of the log file.
 
@@ -1307,15 +1534,20 @@ def tail_autostop_logs(cluster_name: str,
     Returns:
         Return code 0 on success, non-zero on failure.
     """
-    # Check the status of the cluster.
+    if event is not None and event not in constants.HOOK_EVENTS:
+        raise ValueError(f'Invalid hook event {event!r}. Must be one of '
+                         f'{list(constants.HOOK_EVENTS)}.')
     handle = backend_utils.check_cluster_available(
         cluster_name,
-        operation='tailing autostop logs',
+        operation='tailing hook logs',
     )
     backend = backend_utils.get_backend_from_handle(handle)
 
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
-    returnval = backend.tail_autostop_logs(handle, follow=follow, tail=tail)
+    returnval = backend.tail_hook_logs(handle,
+                                       event=event,
+                                       follow=follow,
+                                       tail=tail)
     return returnval
 
 
@@ -1462,8 +1694,16 @@ def enabled_clouds(workspace: Optional[str] = None,
     if workspace is None:
         workspace = skypilot_config.get_active_workspace()
     else:
+        # A read: this only reports which clouds/contexts the workspace has
+        # enabled, so read access is the right level. Requiring write would
+        # deny a workspace the caller can legitimately see (read-only
+        # visibility for non-members), which in turn fails the whole
+        # `enabled_clouds_batch` fan-out below and empties the dashboard's
+        # "Enabled infra" column and Infra page.
         workspaces_core.check_workspace_permission(
-            common_utils.get_current_user(), workspace)
+            common_utils.get_current_user(),
+            workspace,
+            action=workspace_constants.WORKSPACE_ACTION_READ)
     cached_clouds = global_user_state.get_cached_enabled_clouds(
         sky_cloud.CloudCapability.COMPUTE, workspace=workspace)
     with skypilot_config.local_active_workspace_ctx(workspace):
@@ -1735,9 +1975,11 @@ def realtime_slurm_gpu_availability(
 @usage_lib.entrypoint
 def local_up(gpus: bool,
              name: Optional[str] = None,
-             port_start: Optional[int] = None) -> None:
+             port_start: Optional[int] = None,
+             num_nodes: int = 1) -> None:
     """Creates a local cluster."""
-    kubernetes_deploy_utils.deploy_local_cluster(name, port_start, gpus)
+    kubernetes_deploy_utils.deploy_local_cluster(name, port_start, gpus,
+                                                 num_nodes)
 
 
 def local_down(name: Optional[str] = None) -> None:
@@ -1763,7 +2005,8 @@ def create_debug_dump(request_ids: Optional[List[str]] = None,
                       cluster_names: Optional[List[str]] = None,
                       managed_job_ids: Optional[List[int]] = None,
                       recent_minutes: Optional[float] = None,
-                      client_info: Optional[Dict[str, Any]] = None) -> str:
+                      client_info: Optional[Dict[str, Any]] = None,
+                      overall_deadline: Optional[float] = None) -> str:
     """Create a debug dump for troubleshooting.
 
     Args:
@@ -1773,6 +2016,12 @@ def create_debug_dump(request_ids: Optional[List[str]] = None,
         recent_minutes: If specified, include all resources active within
             this many minutes.
         client_info: Optional client-side info to include in the dump.
+        overall_deadline: Optional absolute wall-clock (time.time()) instant to
+            stop the whole collection by; when reached, collection stops early
+            and a partial dump is returned. Passing an absolute deadline lets an
+            out-of-process caller charge already-elapsed time (e.g. executor
+            queue wait) against the budget rather than ignoring it. None means
+            no deadline.
 
     Returns:
         Path to the created zip file on the server.
@@ -1790,7 +2039,8 @@ def create_debug_dump(request_ids: Optional[List[str]] = None,
         cluster_names=cluster_names,
         managed_job_ids=managed_job_ids,
         recent_minutes=recent_minutes,
-        client_info=client_info)
+        client_info=client_info,
+        overall_deadline=overall_deadline)
     logger.info('Debug dump created')
     logger.debug(f'Debug dump path on API server: {debug_dump_path}')
     return str(debug_dump_path)
