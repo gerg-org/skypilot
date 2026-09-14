@@ -1,14 +1,22 @@
 """SDK functions for managed jobs."""
+import dataclasses
 import json
+import os
+import pathlib
+import threading
 import typing
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import (Any, Dict, Iterator, List, Literal, Optional, Sequence, Set,
+                    Tuple, Union)
+import zlib
 
 import click
 
+from sky import exceptions
 from sky import sky_logging
 from sky.backends import backend_utils
 from sky.client import common as client_common
 from sky.client import sdk
+from sky.jobs import constants as managed_job_constants
 from sky.schemas.api import responses
 from sky.serve.client import impl
 from sky.server import common as server_common
@@ -23,6 +31,8 @@ from sky.utils import admin_policy_utils
 from sky.utils import common_utils
 from sky.utils import context
 from sky.utils import dag_utils
+from sky.utils import rich_utils
+from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
     import io
@@ -34,6 +44,117 @@ if typing.TYPE_CHECKING:
 logger = sky_logging.init_logger(__name__)
 
 
+class _AutoJobGroup:
+    """Sentinel for ``launch(job_group=...)``: attach to the surrounding job
+    group when launched from inside one, otherwise launch a top-level job."""
+
+    def __repr__(self) -> str:
+        return 'AUTO_JOB_GROUP'
+
+
+AUTO_JOB_GROUP = _AutoJobGroup()
+
+
+@dataclasses.dataclass(frozen=True)
+class _JobGroupAttachment:
+    """Where a new managed job attaches, as resolved from ``job_group``.
+
+    All ids None: launch a top-level job. ``auto`` is True when the values
+    came from the in-job-group default (the env the controller set on this
+    task) rather than from an explicit ``job_group`` argument. It only
+    matters when the server is too old to record an attachment: an automatic
+    one is dropped with a debug log, an explicit one is an error.
+    """
+    parent_job_id: Optional[int] = None
+    parent_task_id: Optional[int] = None
+    auto: bool = False
+
+    @property
+    def attaches(self) -> bool:
+        return self.parent_job_id is not None
+
+
+def _resolve_job_group(
+    requested_job_group: Union[int, str, None, _AutoJobGroup]
+) -> _JobGroupAttachment:
+    """Turn the ``job_group`` argument into a ``_JobGroupAttachment``.
+
+    Resolution failures (an id with no record, a name matching zero or
+    several running jobs) raise here. Whether the server can accept the
+    attachment is the caller's check.
+
+    - ``AUTO_JOB_GROUP``: attach when running inside a job that is part of
+      a tree, which the controller marks by setting ``SKYPILOT_ROOT_JOB_ID``
+      on the task (a job group's tasks, and a dynamic member's tasks; never a
+      plain top-level job, whose nested launches keep today's behavior). The
+      parent is ``SKYPILOT_MANAGED_JOB_ID`` and the launching task index the
+      ``-<task_id>`` suffix of ``SKYPILOT_TASK_ID``. The tree's root is the
+      server's to work out from the parent's row.
+    - ``None``: never attach.
+    - ``int``: attach to that managed job (the server validates it).
+    - ``str``: a managed job name, resolved to exactly one running job in the
+      workspace (or a decimal job id).
+    """
+    if requested_job_group is None:
+        return _JobGroupAttachment()
+    if isinstance(requested_job_group, _AutoJobGroup):
+        parent_str = os.environ.get(constants.MANAGED_JOB_ID_ENV_VAR, '')
+        root_str = os.environ.get(constants.ROOT_JOB_ID_ENV_VAR, '')
+        if not parent_str.isdigit() or not root_str.isdigit():
+            # Not inside a managed job, or inside one that is not part of a
+            # tree (no root marker): launch top-level.
+            return _JobGroupAttachment(auto=True)
+        parent_job_id = int(parent_str)
+        parent_task_id: Optional[int] = None
+        task_id_str = os.environ.get(constants.TASK_ID_ENV_VAR, '')
+        # Format: <timestamp>_<name>_<job_id>-<task_id>; the task suffix is
+        # only present for managed jobs (see common_utils.get_global_job_id).
+        suffix = task_id_str.rsplit('-', 1)[-1] if '-' in task_id_str else ''
+        if suffix.isdigit():
+            parent_task_id = int(suffix)
+        return _JobGroupAttachment(parent_job_id=parent_job_id,
+                                   parent_task_id=parent_task_id,
+                                   auto=True)
+    if isinstance(requested_job_group, bool):
+        raise ValueError('job_group must be a job id, a job name, None or '
+                         'AUTO_JOB_GROUP.')
+    if isinstance(requested_job_group, int) or requested_job_group.isdigit():
+        # A job id (int, or a decimal string from the CLI). Nothing to look
+        # up: the server validates the job and works out its tree.
+        return _JobGroupAttachment(parent_job_id=int(requested_job_group))
+    if isinstance(requested_job_group, str):
+        # A job name. Ask the server for running jobs whose name contains it
+        # (the only name filter the queue has), then require exactly one
+        # exact match: names are not unique across a job's lifetime. Every
+        # user's jobs count: the server's rule for attaching is the
+        # workspace, not the user, and a teammate's group is a valid target.
+        request_id = queue_v2(refresh=False,
+                              skip_finished=True,
+                              all_users=True,
+                              name_match=requested_job_group,
+                              fields=['job_id', 'job_name'])
+        jobs, _, _, _ = sdk.get(request_id)
+        matching: Set[int] = set()
+        for record in jobs:
+            if (record.job_name == requested_job_group and
+                    record.job_id is not None):
+                matching.add(record.job_id)
+        if not matching:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(f'No running managed job named '
+                                 f'{requested_job_group!r} to attach to. Pass '
+                                 'the job id instead.')
+        if len(matching) > 1:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(f'{len(matching)} running managed jobs are '
+                                 f'named {requested_job_group!r} '
+                                 f'({sorted(matching)}). Pass the job id '
+                                 'instead.')
+        (matched_job_id,) = matching
+        return _JobGroupAttachment(parent_job_id=matched_job_id)
+    raise ValueError(f'Unsupported job_group value: {requested_job_group!r}')
+
+
 @context.contextual
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
@@ -42,6 +163,7 @@ def launch(
     name: Optional[str] = None,
     pool: Optional[str] = None,
     num_jobs: Optional[int] = None,
+    job_group: Union[int, str, None, _AutoJobGroup] = AUTO_JOB_GROUP,
     # Internal only:
     # pylint: disable=invalid-name
     _need_confirmation: bool = False,
@@ -55,6 +177,12 @@ def launch(
         task: sky.Task, or sky.Dag (experimental; 1-task only) to launch as a
             managed job.
         name: Name of the managed job.
+        job_group: Managed job to attach this job to as a dynamic member: it
+            is shown under that job and cancelled with it. Defaults to the
+            surrounding job group when called from inside one (and to no
+            attachment otherwise). Pass ``None`` to launch a top-level job
+            even from inside a job group, or a job id / unique running job
+            name to attach explicitly.
         _need_confirmation: (Internal only) Whether to show a confirmation
             prompt before launching the job.
 
@@ -77,13 +205,31 @@ def launch(
         raise click.UsageError('Pools are not supported in your API server. '
                                'Please upgrade to a newer API server to use '
                                'pools.')
-    if pool is None and num_jobs is not None:
-        raise click.UsageError('Cannot specify num_jobs without pool.')
-
     dag = dag_utils.convert_entrypoint_to_dag(task)
 
     if name is not None:
         dag.name = name
+
+    attachment = _resolve_job_group(job_group)
+    server_supports_attach = (
+        remote_api_version is not None and
+        remote_api_version >= server_constants.MIN_JOBS_PARENT_LINK_API_VERSION)
+    if attachment.attaches and not server_supports_attach:
+        # The server cannot record the attachment, so either way the job
+        # launches top-level. If the user asked for the attachment, stop and
+        # say so rather than hand them an unattached job. If it came from
+        # the in-job-group default, they asked for nothing: a top-level job
+        # is exactly what an older client would have launched.
+        if not attachment.auto:
+            raise click.UsageError(
+                'Attaching a job to a job group is not supported by your API '
+                'server. Please upgrade to a newer API server.')
+        logger.debug(
+            'Not attaching to job group %s: API server version too '
+            'old (need >= %s, got %s).', attachment.parent_job_id,
+            server_constants.MIN_JOBS_PARENT_LINK_API_VERSION,
+            remote_api_version)
+        attachment = _JobGroupAttachment(auto=True)
 
     with admin_policy_utils.apply_and_use_config_in_current_request(
             dag,
@@ -91,7 +237,8 @@ def launch(
             at_client_side=True) as dag:
         sdk.validate(dag)
         if _need_confirmation:
-            job_identity = 'a managed job'
+            job_identity = ('a managed job'
+                            if num_jobs is None else f'{num_jobs} managed jobs')
             if pool is None:
                 optimize_request_id = sdk.optimize(dag)
                 sdk.stream_and_get(optimize_request_id)
@@ -107,8 +254,6 @@ def launch(
                 click.secho(
                     f'Use resources from pool {pool!r}: {job_resources_str}.',
                     fg='green')
-                if num_jobs is not None:
-                    job_identity = f'{num_jobs} managed jobs'
             prompt = f'Launching {job_identity} {dag.name!r}. Proceed?'
             if prompt is not None:
                 click.confirm(prompt,
@@ -152,6 +297,9 @@ def launch(
             pool=pool,
             num_jobs=num_jobs,
             file_mounts_blob_id=file_mounts_blob_id,
+            parent_job_id=attachment.parent_job_id,
+            parent_task_id=attachment.parent_task_id,
+            job_group_explicit=attachment.attaches and not attachment.auto,
         )
         response = server_common.make_authenticated_request(
             'POST',
@@ -170,9 +318,15 @@ def queue_v2(
     all_users: bool = False,
     job_ids: Optional[List[int]] = None,
     limit: Optional[int] = None,
-    fields: Optional[List[str]] = None,
+    fields: Optional[
+        Sequence[str]] = managed_job_constants.DEFAULT_MANAGED_JOB_FIELDS,
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = None,
+    statuses: Optional[List[str]] = None,
+    submitted_after: Optional[float] = None,
+    submitted_before: Optional[float] = None,
+    infra_match: Optional[str] = None,
+    name_match: Optional[str] = None,
 ) -> server_common.RequestId[Tuple[List[responses.ManagedJobRecord], int, Dict[
         str, int], int]]:
     """Gets statuses of managed jobs.
@@ -185,9 +339,21 @@ def queue_v2(
         all_users: Whether to show all users' jobs.
         job_ids: IDs of the managed jobs to show.
         limit: Number of jobs to show.
-        fields: Fields to get for the managed jobs.
+        fields: Fields to get for the managed jobs. Defaults to a lightweight
+            set of fields (see
+            ``sky.jobs.constants.DEFAULT_MANAGED_JOB_FIELDS``) that excludes
+            heavy fields such as the task YAML. Pass ``fields=None`` to fetch
+            every field (larger payload).
         sort_by: Field to sort by (e.g., 'job_id', 'name', 'submitted_at').
         sort_order: Sort direction ('asc' or 'desc').
+        statuses: Only return jobs whose status is in this list.
+        submitted_after: Only show jobs submitted at or after this epoch time
+            (seconds).
+        submitted_before: Only show jobs submitted at or before this epoch
+            time (seconds).
+        infra_match: Only show jobs on this infra, as an ``--infra`` spec:
+            ``cloud``, ``cloud/region`` or ``cloud/region/zone``, with ``*``
+            for any component (e.g. ``k8s/my-context``, ``aws/us-east-1``).
 
     Returns:
         The request ID of the queue request.
@@ -230,6 +396,10 @@ def queue_v2(
     version_to_fields = {
         31: {'is_primary_in_job_group'},
         49: {'batch_total_batches', 'batch_completed_batches'},
+        60: {'root_job_id', 'parent_job_id', 'parent_task_id'},
+        server_constants.MIN_JOBS_DYNAMIC_TASK_INDEX_API_VERSION: {
+            'dynamic_task_index'
+        },
     }
     if fields is not None:
         remote_api_version = versions.get_remote_api_version()
@@ -237,15 +407,41 @@ def queue_v2(
             if remote_api_version is None or remote_api_version < min_version:
                 fields = [f for f in fields if f not in new_fields]
 
+    remote_api_version = versions.get_remote_api_version()
+    if ((submitted_after is not None or submitted_before is not None) and
+            remote_api_version is not None and remote_api_version <
+            server_constants.MIN_JOBS_SUBMITTED_AT_FILTER_API_VERSION):
+        logger.warning(
+            'Filtering managed jobs by submission time is not supported in '
+            'your API server; the server will ignore it and show all jobs. '
+            'Please upgrade the API server to enable it.')
+    if (infra_match is not None and remote_api_version is not None and
+            remote_api_version <
+            server_constants.MIN_JOBS_INFRA_FILTER_API_VERSION):
+        # An error, not a warning like the window filter above: a server that
+        # drops this field answers with jobs on other infra, which reads as a
+        # filtered list and is not one.
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.NotSupportedError(
+                'Filtering managed jobs by infra is not supported by your API '
+                'server. Please upgrade the API server to enable it.')
+
     body = payloads.JobsQueueV2Body(
         refresh=refresh,
         skip_finished=skip_finished,
         all_users=all_users,
         job_ids=job_ids,
         limit=limit,
-        fields=fields,
+        fields=list(fields) if fields is not None else None,
         sort_by=sort_by,
         sort_order=sort_order,
+        statuses=statuses,
+        submitted_after=submitted_after,
+        submitted_before=submitted_before,
+        infra_match=infra_match,
+        # Server-side substring match on the job name (the dashboard's
+        # search box uses the same filter).
+        name_match=name_match,
     )
     path = '/jobs/queue/v2'
     response = server_common.make_authenticated_request(
@@ -356,6 +552,7 @@ def cancel(
     pool: Optional[str] = None,
     graceful: bool = False,
     graceful_timeout: Optional[int] = None,
+    task: Optional[Union[str, int]] = None,
 ) -> server_common.RequestId[None]:
     """Cancels managed jobs.
 
@@ -364,6 +561,10 @@ def cancel(
     Args:
         name: Name of the managed job to cancel.
         job_ids: IDs of the managed jobs to cancel.
+        task: With exactly one job id, cancel only this dynamic task of it
+            (a job launched from inside it), by the index shown in the queue
+            (int) or by name (str). One of the job's declared tasks cannot be
+            cancelled alone.
         all: Whether to cancel all managed jobs.
         all_users: Whether to cancel all managed jobs from all users.
         pool: Pool name to cancel.
@@ -391,6 +592,12 @@ def cancel(
     if graceful and pool is not None:
         logger.warning('Pools are not cleaned up after job cancel, so '
                        '`--graceful` is ignored.')
+    if task is not None and (
+            remote_api_version is None or remote_api_version <
+            server_constants.MIN_JOBS_DYNAMIC_TASK_INDEX_API_VERSION):
+        raise click.UsageError(
+            'Cancelling one task of a job is not supported by your API '
+            'server. Please upgrade to a newer API server.')
     body = payloads.JobsCancelBody(
         name=name,
         job_ids=job_ids,
@@ -399,6 +606,7 @@ def cancel(
         pool=pool,
         graceful=graceful,
         graceful_timeout=graceful_timeout,
+        task=task,
     )
     response = server_common.make_authenticated_request(
         'POST',
@@ -408,17 +616,54 @@ def cancel(
     return server_common.get_request_id(response=response)
 
 
-@usage_lib.entrypoint
-@server_common.check_server_healthy_or_start
-@rest.retry_transient_errors()
+@typing.overload
+def tail_logs(
+    name: Optional[str] = None,
+    job_id: Optional[int] = None,
+    follow: bool = True,
+    controller: bool = False,
+    refresh: bool = False,
+    tail: Optional[int] = None,
+    tail_offset: Optional[int] = None,
+    output_stream: Optional['io.TextIOBase'] = None,
+    task: Optional[Union[str, int]] = None,
+    *,  # keyword only separator
+    preload_content: Literal[True] = True
+) -> Optional[int]:
+    ...
+
+
+@typing.overload
 def tail_logs(name: Optional[str] = None,
               job_id: Optional[int] = None,
               follow: bool = True,
               controller: bool = False,
               refresh: bool = False,
               tail: Optional[int] = None,
-              output_stream: Optional['io.TextIOBase'] = None,
-              task: Optional[Union[str, int]] = None) -> Optional[int]:
+              tail_offset: Optional[int] = None,
+              output_stream: None = None,
+              task: Optional[Union[str, int]] = None,
+              *,
+              preload_content: Literal[False]) -> Iterator[Optional[str]]:
+    ...
+
+
+@usage_lib.entrypoint
+@server_common.check_server_healthy_or_start
+@rest.retry_transient_errors()
+def tail_logs(
+    name: Optional[str] = None,
+    job_id: Optional[int] = None,
+    follow: bool = True,
+    controller: bool = False,
+    refresh: bool = False,
+    tail: Optional[int] = None,
+    tail_offset: Optional[int] = None,
+    output_stream: Optional['io.TextIOBase'] = None,
+    task: Optional[Union[str, int]] = None,
+    *,  # keyword only separator
+    preload_content: bool = True
+) -> Union[Optional[int], Iterator[Optional[str]]]:
     """Tails logs of managed jobs.
 
     You can provide either a job name or a job ID to tail logs. If both are not
@@ -432,17 +677,26 @@ def tail_logs(name: Optional[str] = None,
         refresh: Whether to restart the jobs controller if it is stopped.
         tail: Number of lines to tail from the end of the log file.
         output_stream: The stream to write the logs to. If None, print to the
-            console.
+            console. Cannot be used with preload_content=False.
         task: Task identifier to view logs for a specific task in a JobGroup.
             If an int, it is treated as a task ID. If a str, it is treated as
             a task name. If None, logs for all tasks are shown.
+        preload_content: if False, returns an Iterator[str | None] containing
+            the logs without the function blocking on the retrieval of the
+            entire log. Iterator returns None when the log has been completely
+            streamed. Default True. Cannot be used with output_stream.
 
     Returns:
-        Exit code based on success or failure of the job. 0 if success,
-        100 if the job failed. See exceptions.JobExitCode for possible exit
-        codes.
-        Will return None if follow is False
-        (see note in sky/client/sdk.py::stream_response)
+        If preload_content is True:
+            Exit code based on success or failure of the job. 0 if success,
+            100 if the job failed. See exceptions.JobExitCode for possible exit
+            codes.
+            Will return None if follow is False
+            (see note in sky/client/sdk.py::stream_response)
+        If preload_content is False:
+            Iterator[str | None] containing the logs without the function
+            blocking on the retrieval of the entire log. Iterator returns None
+            when the log has been completely streamed.
 
     Request Raises:
         ValueError: invalid arguments.
@@ -451,6 +705,12 @@ def tail_logs(name: Optional[str] = None,
     if tail is not None and tail <= 0:
         raise ValueError(
             f'tail must be None or a positive integer, got {tail}.')
+    if tail_offset is not None and tail_offset < 0:
+        raise ValueError(f'tail_offset must be None or a non-negative integer, '
+                         f'got {tail_offset}.')
+    if output_stream is not None and not preload_content:
+        raise ValueError(
+            'output_stream cannot be specified when preload_content is False')
     body = payloads.JobsLogsBody(
         name=name,
         job_id=job_id,
@@ -458,6 +718,7 @@ def tail_logs(name: Optional[str] = None,
         controller=controller,
         refresh=refresh,
         tail=tail,
+        tail_offset=tail_offset,
         task=task,
     )
     response = server_common.make_authenticated_request(
@@ -468,13 +729,16 @@ def tail_logs(name: Optional[str] = None,
         timeout=(5, None))
     request_id: server_common.RequestId[int] = server_common.get_request_id(
         response)
-    # Log request is idempotent when tail is None or 0 (both stream from
-    # the beginning), thus can resume previous streaming point on retry.
-    return sdk.stream_response(request_id=request_id,
-                               response=response,
-                               output_stream=output_stream,
-                               resumable=(tail is None or tail == 0),
-                               get_result=follow)
+    if preload_content:
+        # Log request is idempotent when tail is None or 0 (both stream from
+        # the beginning), thus can resume previous streaming point on retry.
+        return sdk.stream_response(request_id=request_id,
+                                   response=response,
+                                   output_stream=output_stream,
+                                   resumable=(tail is None or tail == 0),
+                                   get_result=follow)
+    else:
+        return rich_utils.decode_rich_status(response)
 
 
 @context.contextual
@@ -532,6 +796,131 @@ def wait(
         json=json.loads(body.model_dump_json()),
         timeout=(5, None))
     return server_common.get_request_id(response=response)
+
+
+@usage_lib.entrypoint
+@server_common.check_server_healthy_or_start
+def download_logs_streaming(
+    name: Optional[str],
+    job_id: Optional[int],
+    refresh: bool,
+    controller: bool,
+    local_dir: str = constants.SKY_LOGS_DIRECTORY,
+) -> Optional[Dict[int, str]]:
+    """Download a managed job's log via the streaming /api/stream path.
+
+    Returns None when the server stream is empty (e.g. terminal job
+    whose worker cluster is gone) — the caller should fall back to
+    ``download_logs``.
+
+    This dispatches the same /jobs/logs (tail=None, follow=False) path
+    that the live-tail UI uses, then attaches to /api/stream with
+    compress=gz so gzip framing saves bandwidth on the wire. The
+    response is decompressed on the client and saved as a plain log
+    file inside a per-job directory; the directory shape matches the
+    legacy ``download_logs`` output (``<dir>/controller.log`` for
+    ``--controller``, ``<dir>/run.log`` otherwise) so callers that
+    walk the returned path with ``[ -d ]`` / ``cat <dir>/foo.log``
+    keep working.
+
+    Returns:
+        ``{job_id: local_directory}``. The directory contains
+        ``controller.log`` (controller mode) or ``run.log``
+        (non-controller).
+    """
+    body = payloads.JobsLogsBody(
+        name=name,
+        job_id=job_id,
+        follow=False,
+        controller=controller,
+        refresh=refresh,
+        tail=None,
+    )
+    dispatch = server_common.make_authenticated_request(
+        'POST',
+        '/jobs/logs',
+        json=json.loads(body.model_dump_json()),
+        stream=True,
+        timeout=(5, None))
+    if not dispatch.ok:
+        raise RuntimeError(
+            f'Failed to dispatch /jobs/logs: HTTP {dispatch.status_code}')
+    request_id = dispatch.headers.get(server_constants.STREAM_REQUEST_HEADER) \
+        or dispatch.headers.get('X-SkyPilot-Request-ID')
+    if not request_id:
+        raise RuntimeError(
+            '/jobs/logs response missing X-SkyPilot-Request-ID header')
+
+    # Drain the dispatch body in a background thread. Cancelling/closing
+    # would tell the API server the client disconnected and the running
+    # tail_logs task would be cancelled, leaving /api/stream with only
+    # a partial log. Reading and discarding keeps the request alive.
+    def _drain() -> None:
+        try:
+            for _ in dispatch.iter_content(chunk_size=64 * 1024):
+                pass
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    threading.Thread(target=_drain, daemon=True).start()
+
+    stream_url = (f'/api/stream?request_id={request_id}'
+                  '&format=plain&compress=gz')
+    stream_resp = server_common.make_authenticated_request('GET',
+                                                           stream_url,
+                                                           stream=True,
+                                                           timeout=(5, None))
+    if not stream_resp.ok:
+        raise RuntimeError(
+            f'Failed to attach to /api/stream: HTTP {stream_resp.status_code}')
+
+    # Save into a per-job directory matching the legacy download_logs
+    # shape (<dir>/controller.log or <dir>/run.log) so existing scripts
+    # that grep <path>/controller.log keep working. Decompress on the
+    # client when the server gzipped the stream — older API servers
+    # without compress=gz support silently ignore the query param and
+    # return text/plain, so sniff Content-Type and skip decompression
+    # in that case.
+    content_type = (stream_resp.headers.get('Content-Type') or '').lower()
+    is_gzipped = content_type.startswith('application/gzip')
+    decompressor = (zlib.decompressobj(16 +
+                                       zlib.MAX_WBITS) if is_gzipped else None)
+    log_type = 'controller' if controller else 'job'
+    log_filename = 'controller.log' if controller else 'run.log'
+    job_label = job_id if job_id is not None else (name or 'latest')
+    job_dir = (pathlib.Path(local_dir).expanduser() / 'managed_jobs' /
+               f'managed-{log_type}-{job_label}')
+    job_dir.mkdir(parents=True, exist_ok=True)
+    local_path = job_dir / log_filename
+
+    bytes_written = 0
+    with open(local_path, 'wb') as f:
+        for chunk in stream_resp.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            out = decompressor.decompress(chunk) if decompressor else chunk
+            if out:
+                f.write(out)
+                bytes_written += len(out)
+        if decompressor is not None:
+            tail_bytes = decompressor.flush()
+            if tail_bytes:
+                f.write(tail_bytes)
+                bytes_written += len(tail_bytes)
+
+    if bytes_written == 0:
+        # Server sent nothing (e.g., terminal job, worker cluster gone) —
+        # the underlying tail_logs has no source. Remove the empty file
+        # + dir and return None so the caller falls back to sync-down.
+        try:
+            local_path.unlink()
+            job_dir.rmdir()
+        except OSError:
+            pass
+        return None
+
+    key = int(job_id) if job_id is not None else 0
+    return {key: str(job_dir)}
 
 
 @usage_lib.entrypoint
