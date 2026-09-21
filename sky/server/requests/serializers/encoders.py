@@ -163,18 +163,30 @@ def encode_jobs_queue_v2(
         jobs_or_tuple) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
     # Support returning either a plain jobs list or a (jobs, total) tuple
     status_counts: Dict[str, int] = {}
+    # The 4-tuple is still accepted: a plugin runner pinned to the older
+    # signature returns one, and it simply carries no infra options.
+    infra_options: List[str] = []
     if isinstance(jobs_or_tuple, tuple):
         if len(jobs_or_tuple) == 2:
             jobs, total = jobs_or_tuple
             total_no_filter = total
         elif len(jobs_or_tuple) == 4:
             jobs, total, status_counts, total_no_filter = jobs_or_tuple
+        elif len(jobs_or_tuple) == 5:
+            (jobs, total, status_counts, total_no_filter,
+             infra_options) = jobs_or_tuple
         else:
             raise ValueError(f'Invalid jobs tuple: {jobs_or_tuple}')
     else:
         jobs = jobs_or_tuple
         total = None
-    jobs_dict = [job.model_dump(by_alias=True) for job in jobs]
+    # exclude_unset: fields the server never populated (because the request's
+    # ``fields`` filter excluded them) are omitted from the payload instead of
+    # being emitted as explicit nulls. Requests without a ``fields`` filter
+    # populate every field, so their responses are unchanged.
+    jobs_dict = [
+        job.model_dump(by_alias=True, exclude_unset=True) for job in jobs
+    ]
     for job in jobs_dict:
         job['status'] = job['status'].value
     if total is None:
@@ -183,7 +195,8 @@ def encode_jobs_queue_v2(
         'jobs': jobs_dict,
         'total': total,
         'total_no_filter': total_no_filter,
-        'status_counts': status_counts
+        'status_counts': status_counts,
+        'infra_options': infra_options,
     }
 
 
