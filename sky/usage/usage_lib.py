@@ -1,14 +1,21 @@
 """Logging events to Grafana Loki."""
 
 import contextlib
+import contextvars
 import datetime
 import enum
+import functools
 import json
 import os
+import threading
 import time
 import traceback
 import typing
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Union
+from typing import (Any, Callable, ClassVar, Collection, Dict, List, Optional,
+                    Set, Union)
+import urllib.parse
+import urllib.request
+import uuid
 
 from typing_extensions import ParamSpec
 
@@ -28,10 +35,29 @@ if typing.TYPE_CHECKING:
 
     import requests
 
+    from sky import clouds as sky_clouds
+    from sky import global_user_state
+    from sky import models
     from sky import resources as resources_lib
     from sky import task as task_lib
+    from sky.adaptors import slurm as slurm_adaptor
+    from sky.clouds import cloud as cloud_lib
+    from sky.provision.kubernetes import utils as kubernetes_utils
+    from sky.provision.slurm import utils as slurm_utils
     from sky.utils import status_lib
+    from sky.utils import subprocess_utils
+    from sky.utils.db import kv_cache
 else:
+    # These modules import usage_lib through cloud/provisioning and database
+    # dependencies. Defer their resolution to avoid initialization cycles.
+    sky_clouds = adaptors_common.LazyImport('sky.clouds')
+    global_user_state = adaptors_common.LazyImport('sky.global_user_state')
+    cloud_lib = adaptors_common.LazyImport('sky.clouds.cloud')
+    kubernetes_utils = adaptors_common.LazyImport(
+        'sky.provision.kubernetes.utils')
+    slurm_utils = adaptors_common.LazyImport('sky.provision.slurm.utils')
+    subprocess_utils = adaptors_common.LazyImport('sky.utils.subprocess_utils')
+    kv_cache = adaptors_common.LazyImport('sky.utils.db.kv_cache')
     # requests and inspect cost ~100ms to load, which can be postponed to
     # collection phase or skipped if user specifies no collection
     requests = adaptors_common.LazyImport('requests')
@@ -88,7 +114,15 @@ class UsageMessageToReport(MessageToReport):
         # auth is enabled at the API server level.
         self.client_user_hash: Optional[str] = os.environ.get(
             skylet_constants.CLIENT_USER_HASH_ENV_VAR)
-        self.run_id: str = common_utils.get_usage_run_id()
+        # Read SKYPILOT_USAGE_RUN_ID directly. ``os.environ`` is hijacked
+        # to be SkyPilotContext aware, so this read picks up per-context
+        # overrides (e.g. those installed by ``ctx.override_envs`` in
+        # ``sky.jobs.controller.run_job_loop``) and is re-evaluated on
+        # every fresh construction — including when
+        # ``messages.reset(USAGE)`` rebuilds the message after a
+        # decorated entrypoint exits.
+        self.run_id: str = (os.environ.get(constants.USAGE_RUN_ID_ENV_VAR) or
+                            str(uuid.uuid4()))
         self.sky_version: str = sky.__version__
         self.sky_commit: str = sky.__commit__
 
@@ -102,6 +136,10 @@ class UsageMessageToReport(MessageToReport):
         self.entrypoint: Optional[str] = None  # entrypoint_context
         #: Whether entrypoint is called by sky internal code.
         self.internal: bool = False  # set_internal
+        #: Whether the Scarf ping is suppressed for this entrypoint (e.g.
+        #: dryrun). Underscore-prefixed so it is excluded from the message
+        #: sent to Loki.
+        self._scarf_ping_skipped: bool = False  # skip_scarf_ping
 
         # Basic info for the clusters.
         #: Clusters operated by the command.
@@ -189,6 +227,12 @@ class UsageMessageToReport(MessageToReport):
 
     def set_internal(self):
         self.internal = True
+
+    def skip_scarf_ping(self):
+        self._scarf_ping_skipped = True
+
+    def scarf_ping_skipped(self) -> bool:
+        return self._scarf_ping_skipped
 
     def update_user_task_yaml(self, yaml_config_or_path: Union[Dict, str]):
         self.user_task_yaml = prepare_json_from_yaml_config(yaml_config_or_path)
@@ -306,15 +350,32 @@ class HeartbeatMessageToReport(MessageToReport):
         # This interval_seconds is mainly for recording the heartbeat interval
         # in the heartbeat message, so that the collector can use it.
         self.interval_seconds = interval_seconds
+        # Optional cluster placement, accelerator, and provenance context.
+        # Populated by ``send_heartbeat`` callers that have this info; left
+        # as ``None`` otherwise.
+        self.cloud: Optional[str] = None
+        self.region: Optional[str] = None
+        self.zone: Optional[str] = None
+        self.gpu_type: Optional[str] = None
+        self.num_nodes: Optional[int] = None
+        self.gpus_per_node: Optional[int] = None
+        self.user: Optional[str] = None
+        self.use_spot: Optional[bool] = None
+        self.instance_type: Optional[str] = None
 
     def get_properties(self) -> Dict[str, Any]:
         properties = super().get_properties()
-        # The run id is set by the skylet, which will always be the same for
-        # the entire lifetime of the run.
-        with open(os.path.expanduser(constants.USAGE_RUN_ID_FILE),
-                  'r',
-                  encoding='utf-8') as f:
-            properties['run_id'] = f.read().strip()
+        # Prefer the run id from the env var if set (e.g. from a request
+        # context in the API server, where contextvars-based isolation
+        # makes it per-job). Fall back to the file the skylet writes at
+        # cluster provisioning time.
+        run_id = os.environ.get(constants.USAGE_RUN_ID_ENV_VAR)
+        if not run_id:
+            with open(os.path.expanduser(constants.USAGE_RUN_ID_FILE),
+                      'r',
+                      encoding='utf-8') as f:
+                run_id = f.read().strip()
+        properties['run_id'] = run_id
         return properties
 
 
@@ -335,7 +396,16 @@ class ServerHeartbeatMessage(MessageToReport):
         sky_version: str — SkyPilot version
         ingress_host: Optional[str] — ingress DNS hostname if deployed
             with ingress (from SKYPILOT_INGRESS_HOST env var)
-        plugins: Dict[str, Any] — per-plugin data from registered providers
+        total_gpus: int — installed accelerator capacity (GPUs, TPUs, Neuron)
+            across all allowed Kubernetes/SSH contexts and Slurm clusters.
+            Cloud VMs have no node inventory and do not contribute.
+        gpus_by_type: Dict[str, int] — per-accelerator-type breakdown of
+            total_gpus; TPU and Neuron types remain distinct from GPU types
+        infra_count: Dict[str, int] — how many infrastructures of each kind
+            the server is configured to use, e.g.
+            ``{'kubernetes': 3, 'ssh_node_pools': 1, 'slurm': 0, 'clouds': 2}``
+        plugins: Dict[str, Any] — per-plugin data from registered providers.
+            Omitted entirely when no plugin registered a provider.
     """
 
     _data_providers: ClassVar[Dict[str, Callable[[], Dict[str, Any]]]] = {}
@@ -350,6 +420,11 @@ class ServerHeartbeatMessage(MessageToReport):
         self.server_hash: str = common_utils.get_user_hash()
         self.sky_version: str = sky.__version__
         self.ingress_host: Optional[str] = os.getenv('SKYPILOT_INGRESS_HOST')
+        self.total_gpus: int = 0
+        #: Per-accelerator-type breakdown, including GPU, TPU and Neuron types.
+        self.gpus_by_type: Dict[str, int] = {}
+        #: Per-infra-kind counts, e.g. ``{'kubernetes': 3, 'clouds': 2}``.
+        self.infra_count: Dict[str, int] = {}
 
     @classmethod
     def register_provider(cls, name: str,
@@ -357,12 +432,13 @@ class ServerHeartbeatMessage(MessageToReport):
         """Register a plugin data provider. Called during plugin install()."""
         cls._data_providers[name] = provider
 
-    @classmethod
-    def has_providers(cls) -> bool:
-        return len(cls._data_providers) > 0
-
     def get_properties(self) -> Dict[str, Any]:
         properties = super().get_properties()
+        # Plugin metrics stay opt-in: only deployments where a plugin
+        # registered a provider report a 'plugins' field at all. The GPU and
+        # infra counts above are reported by every API server.
+        if not self._data_providers:
+            return properties
         plugins_data = {}
         for name, provider in self._data_providers.items():
             try:
@@ -421,7 +497,97 @@ class MessageCollection:
         return self._messages.values()
 
 
-messages = MessageCollection()
+# Per-context MessageCollection. Reads/writes to ``messages`` go through
+# this ContextVar so that asynchronous tasks (e.g. concurrent JobController
+# coroutines in the consolidated managed jobs controller process) each get
+# their own message state instead of stomping on a process-wide singleton.
+#
+# Lazy creation: the first access in any contextvars Context creates a
+# MessageCollection and installs it via ``ContextVar.set`` — that set is
+# scoped to the current Context, so siblings (e.g. distinct
+# @contextual_async coroutines, each running inside its own copied
+# Context) get independent instances. Synchronous callers in the same
+# Context (e.g. plain CLI use) continue to share one collection.
+_messages_var: contextvars.ContextVar[Optional[MessageCollection]] = (
+    contextvars.ContextVar('usage_messages', default=None))
+
+
+def _get_messages() -> MessageCollection:
+    """Return the MessageCollection for the current context.
+
+    Lazily creates a fresh MessageCollection the first time it is
+    accessed in a given contextvars Context, so different async tasks
+    (whose Contexts are independent copies) see independent collections.
+    """
+    ctx_messages = _messages_var.get()
+    if ctx_messages is None:
+        ctx_messages = MessageCollection()
+        _messages_var.set(ctx_messages)
+    return ctx_messages
+
+
+def install_fresh_messages_for_current_context() -> None:
+    """Install a freshly-initialized MessageCollection in this Context.
+
+    Use this at boundaries where the caller has just established a new
+    per-task identity (e.g. a managed job's controller coroutine after
+    loading the per-job env file). It overrides any MessageCollection
+    inherited from a parent Context — for example, one created at
+    module import time, when class-body decorators like
+    ``@usage_lib.messages.usage.update_runtime('provision')`` first
+    accessed the proxy and triggered lazy creation against the process
+    env (which carries the run id of whoever first spawned this
+    process, not of the per-task caller).
+
+    The override is scoped to the current contextvars Context, so
+    sibling tasks (each with their own Context via
+    ``@context.contextual_async``) keep their own collections. The new
+    collection's ``UsageMessageToReport.__init__`` reads
+    ``SKYPILOT_USAGE_RUN_ID`` directly from ``os.environ`` (which is
+    SkyPilotContext aware), so the new run id reflects the per-task
+    env that was just installed via ``ctx.override_envs``. Subsequent
+    ``messages.reset(USAGE)`` calls inside this Context (e.g. from
+    ``_send_to_loki`` after ``sdk.api_start``'s entrypoint context
+    manager exits) will likewise re-read env via the same path and
+    keep the per-task run id stable across resets.
+    """
+    _messages_var.set(MessageCollection())
+
+
+class _MessagesProxy:
+    """Module-level facade that delegates to the per-context collection.
+
+    Existing call sites read/write ``messages.usage.foo`` etc.; this proxy
+    forwards each access to the MessageCollection associated with the
+    current context, so callers do not need to change.
+    """
+
+    @property
+    def usage(self) -> UsageMessageToReport:
+        return _get_messages().usage
+
+    @property
+    def heartbeat(self) -> HeartbeatMessageToReport:
+        return _get_messages().heartbeat
+
+    @property
+    def server_heartbeat(self) -> ServerHeartbeatMessage:
+        return _get_messages().server_heartbeat
+
+    def reset(self, message_type: MessageType) -> None:
+        _get_messages().reset(message_type)
+
+    def __getitem__(self, key: MessageType) -> MessageToReport:
+        return _get_messages()[key]
+
+    def items(self):
+        return _get_messages().items()
+
+    def values(self):
+        return _get_messages().values()
+
+
+messages = _MessagesProxy()
 
 
 def _send_to_loki(message_type: MessageType):
@@ -448,8 +614,16 @@ def _send_to_loki(message_type: MessageType):
         'schema_version': message.schema_version,
     }
     if message_type == MessageType.USAGE:
-        prom_labels['new_cluster'] = (message.original_cluster_status != 'UP'
-                                      and message.final_cluster_status == 'UP')
+        # Narrow ``message`` to UsageMessageToReport for the type checker;
+        # ``messages[message_type]`` returns the abstract MessageToReport
+        # base type. ``messages.usage`` is annotated as
+        # UsageMessageToReport, and refers to the same per-context
+        # instance that ``messages[message_type]`` returned for
+        # ``MessageType.USAGE``.
+        usage_message = messages.usage
+        prom_labels['new_cluster'] = (
+            usage_message.original_cluster_status != 'UP' and
+            usage_message.final_cluster_status == 'UP')
 
     headers = {'Content-type': 'application/json'}
     payload = {
@@ -551,14 +725,322 @@ def store_exception(e: Union[Exception, SystemExit, KeyboardInterrupt]) -> None:
             common_utils.format_exception(e))
 
 
-def send_heartbeat(interval_seconds: int = 600):
+def send_heartbeat(
+    interval_seconds: int = 600,
+    cloud: Optional[str] = None,
+    region: Optional[str] = None,
+    zone: Optional[str] = None,
+    gpu_type: Optional[str] = None,
+    num_nodes: Optional[int] = None,
+    gpus_per_node: Optional[int] = None,
+    user: Optional[str] = None,
+    use_spot: Optional[bool] = None,
+    instance_type: Optional[str] = None,
+):
+    """Send one heartbeat record.
+
+    Args:
+        interval_seconds: cadence at which this caller emits heartbeats.
+        cloud: cloud the cluster is running on.
+        region: cloud region the cluster is running in.
+        zone: cloud zone the cluster is running in (when applicable).
+        gpu_type: accelerator type (e.g. ``H100``).
+        num_nodes: current alive node count for the cluster.
+        gpus_per_node: accelerators allocated per node.
+        user: hash of the user who launched the cluster, propagated from
+            the orchestrator.
+        use_spot: whether the cluster was launched on spot resources.
+        instance_type: cloud instance type used for the cluster.
+
+    All cluster/accelerator/provenance fields are optional. When set,
+    they are written onto the singleton heartbeat message and reset
+    after each send so values do not leak between calls.
+    """
     messages.heartbeat.interval_seconds = interval_seconds
+    if cloud is not None:
+        messages.heartbeat.cloud = cloud
+    if region is not None:
+        messages.heartbeat.region = region
+    if zone is not None:
+        messages.heartbeat.zone = zone
+    if gpu_type is not None:
+        messages.heartbeat.gpu_type = gpu_type
+    if num_nodes is not None:
+        messages.heartbeat.num_nodes = num_nodes
+    if gpus_per_node is not None:
+        messages.heartbeat.gpus_per_node = gpus_per_node
+    if user is not None:
+        messages.heartbeat.user = user
+    if use_spot is not None:
+        messages.heartbeat.use_spot = use_spot
+    if instance_type is not None:
+        messages.heartbeat.instance_type = instance_type
     _send_to_loki(MessageType.HEARTBEAT)
 
 
+def _try_list(kind: str,
+              fn: Callable[[], Collection[Any]]) -> Optional[Collection[Any]]:
+    """Run a lookup that returns a collection; None if it raised.
+
+    None and an empty collection mean different things to the callers:
+    nothing configured is a real zero and is reported, while a failed lookup
+    leaves that count out of the payload entirely.
+    """
+    try:
+        return fn()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Heartbeat {kind} lookup failed: {e}')
+        return None
+
+
+def _list_workspace_infra(
+        kind: str, fn: Callable[[],
+                                Collection[Any]]) -> Optional[Collection[Any]]:
+    """Union configured infrastructure across workspaces, including default."""
+    workspaces = skypilot_config.get_nested(('workspaces',), default_value={})
+    names = set(workspaces) | {skylet_constants.SKYPILOT_DEFAULT_WORKSPACE}
+    result: Set[Any] = set()
+    for workspace in sorted(names):
+        with skypilot_config.local_active_workspace_ctx(workspace):
+            values = _try_list(kind, fn)
+        if values is None:
+            # A partial count must not be presented as a complete inventory.
+            return None
+        result.update(values)
+    return result
+
+
 def send_server_heartbeat():
-    """Send server-side heartbeat with plugin metrics to Loki."""
+    """Send server-side heartbeat with fleet and plugin metrics to Loki."""
+
+    # Resolved once and shared by both collectors: each lookup re-parses the
+    # kubeconfig or ~/.slurm/config.
+    k8s_contexts = _list_workspace_infra(
+        'kubernetes',
+        lambda: sky_clouds.Kubernetes.existing_allowed_contexts(silent=True))
+    ssh_contexts = _list_workspace_infra(
+        'ssh', lambda: sky_clouds.SSH.existing_allowed_contexts(silent=True))
+    slurm_clusters = _list_workspace_infra(
+        'slurm',
+        lambda: sky_clouds.Slurm.existing_allowed_clusters(silent=True))
+
+    msg = messages.server_heartbeat
+    msg.gpus_by_type = _collect_gpu_fleet(
+        list(k8s_contexts or []) + list(ssh_contexts or []),
+        list(slurm_clusters or []))
+    msg.total_gpus = sum(msg.gpus_by_type.values())
+    msg.infra_count = _collect_infra_count(k8s_contexts, ssh_contexts,
+                                           slurm_clusters)
     _send_to_loki(MessageType.SERVER_HEARTBEAT)
+
+
+# ---------------------------------------------------------------------------
+# Fleet GPU capacity.
+#
+# Installed GPU capacity per infrastructure, cached in the kv_cache DB table
+# under NODE_INFO_CACHE_KEY_PREFIX. The rows live in the DB rather than in
+# memory because each internal daemon runs in its own executor worker —
+# sky.server.config._get_min_short_workers() provisions one extra worker per
+# daemon — so an in-process cache filled while serving a request would never
+# be read by the heartbeat. Only derived per-type totals are stored; the node
+# inventories they come from are not.
+# ---------------------------------------------------------------------------
+
+
+def _k8s_capacity_id(context: Optional[str]) -> str:
+    """Cache id for a Kubernetes or SSH context. None is the in-cluster one."""
+    return f'kubernetes/{context or ""}'
+
+
+def _slurm_capacity_id(cluster: str) -> str:
+    return f'slurm/{cluster}'
+
+
+def _gpu_capacity_from_nodes(
+        nodes_info: 'models.KubernetesNodesInfo') -> Dict[str, int]:
+    """Reduce a context's node inventory to GPU counts per accelerator type."""
+    counts: Dict[str, int] = {}
+    for node_info in nodes_info.node_info_dict.values():
+        count = int(node_info.total.get('accelerator_count', 0) or 0)
+        if count <= 0:
+            continue
+        acc_type = str(node_info.accelerator_type or 'gpu')
+        counts[acc_type] = counts.get(acc_type, 0) + count
+    return counts
+
+
+def _gpu_capacity_from_slurm_nodes(
+        nodes_info: List['slurm_adaptor.NodeInfo']) -> Dict[str, int]:
+    """Reduce a Slurm cluster's ``sinfo`` rows to GPU counts per type.
+
+    ``sinfo --Node`` emits one row per node *per partition*, so a node in two
+    partitions appears twice. Dedupe by node name before summing.
+    """
+    counts: Dict[str, int] = {}
+    seen = set()
+    for node in nodes_info:
+        if node.node in seen:
+            continue
+        seen.add(node.node)
+        gpu_type, count = slurm_utils.get_gpu_type_and_count(node.gres)
+        if count <= 0:
+            continue
+        # GRES without a type (``gpu:8``) still counts; label it plainly.
+        acc_type = gpu_type or 'gpu'
+        counts[acc_type] = counts.get(acc_type, 0) + count
+    return counts
+
+
+def _read_all_capacity() -> Dict[str, Dict[str, int]]:
+    """Read every unexpired capacity row in one query, keyed by infra id."""
+    prefix = constants.NODE_INFO_CACHE_KEY_PREFIX
+    try:
+        rows = kv_cache.get_cache_entries_by_prefix(prefix)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Heartbeat capacity read failed: {e}')
+        return {}
+    recorded: Dict[str, Dict[str, int]] = {}
+    for key, raw in rows.items():
+        try:
+            recorded[key[len(prefix):]] = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return recorded
+
+
+def record_gpu_capacity(infra: str, counts: Dict[str, int]) -> None:
+    """Record one infra's GPU capacity for the heartbeat.
+
+    A row that has not yet expired is left alone, so an infra is refreshed at
+    most once per NODE_INFO_CACHE_TTL_SECONDS no matter how many processes
+    read its inventory. That check is one indexed read. Skipped when the user
+    disabled usage collection.
+    """
+    if env_options.Options.DISABLE_LOGGING.get():
+        return
+    key = constants.NODE_INFO_CACHE_KEY_PREFIX + infra
+    try:
+        if kv_cache.get_cache_entry(key) is not None:
+            return
+        kv_cache.add_or_update_cache_entry(
+            key, json.dumps(counts),
+            time.time() + constants.NODE_INFO_CACHE_TTL_SECONDS)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Heartbeat capacity write failed for {infra!r}: {e}')
+
+
+def record_node_info(context: Optional[str],
+                     nodes_info: 'models.KubernetesNodesInfo') -> None:
+    """Record a Kubernetes context's GPU capacity from a fetched inventory.
+
+    Called for every ``get_kubernetes_node_info()`` result, whatever the
+    caller wanted it for — the dashboard, ``sky show-gpus``, provisioning, a
+    plugin's own collection — so on a server that reads node info for any
+    other reason the heartbeat adds no Kubernetes API load of its own.
+
+    InternalRequestDaemon.run_event() sets SKYPILOT_DISABLE_USAGE_COLLECTION
+    process-wide, so node info read inside *other* daemons is not recorded.
+    That is a missed refresh, not an error; the heartbeat fetches on its own
+    when a row is missing.
+    """
+    if env_options.Options.DISABLE_LOGGING.get():
+        return
+    record_gpu_capacity(_k8s_capacity_id(context),
+                        _gpu_capacity_from_nodes(nodes_info))
+
+
+def _fetch_k8s_capacity(context: Optional[str]) -> Dict[str, int]:
+    # The query records itself via record_node_info on the way out.
+    return _gpu_capacity_from_nodes(
+        kubernetes_utils.get_kubernetes_node_info(context))
+
+
+def _fetch_slurm_capacity(cluster: str) -> Dict[str, int]:
+    # get_slurm_nodes_info caches sinfo itself, so this is usually no SSH.
+    counts = _gpu_capacity_from_slurm_nodes(
+        slurm_utils.get_slurm_nodes_info(cluster))
+    record_gpu_capacity(_slurm_capacity_id(cluster), counts)
+    return counts
+
+
+def _collect_gpu_fleet(contexts: List[Optional[str]],
+                       slurm_clusters: List[str]) -> Dict[str, int]:
+    """Sum installed accelerator capacity per type across the fleet.
+
+    Covers every allowed Kubernetes and SSH context and every allowed Slurm
+    cluster. This is capacity, not usage: an idle GPU node counts the same as
+    a busy one. Clusters on cloud VMs have no node inventory to read and do
+    not contribute. TPU and Neuron devices contribute to the total under
+    their own accelerator types, despite the GPU-oriented field names.
+
+    Recorded rows are read in one query; only infras with no unexpired row
+    are queried, in parallel, and each is guarded so an unreachable one drops
+    out of the total for this tick rather than failing the heartbeat.
+    """
+    fetchers: Dict[str, Callable[[], Dict[str, int]]] = {}
+    for context in contexts:
+        fetchers[_k8s_capacity_id(context)] = functools.partial(
+            _fetch_k8s_capacity, context)
+    for cluster in slurm_clusters:
+        fetchers[_slurm_capacity_id(cluster)] = functools.partial(
+            _fetch_slurm_capacity, cluster)
+
+    recorded = _read_all_capacity()
+    misses = [infra for infra in fetchers if infra not in recorded]
+
+    def _fetch(infra: str) -> Dict[str, int]:
+        try:
+            return fetchers[infra]()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(f'Heartbeat GPU fleet skipped {infra!r}: {e}')
+            return {}
+
+    for infra, counts in zip(misses,
+                             subprocess_utils.run_in_parallel(_fetch, misses)):
+        recorded[infra] = counts
+
+    gpus_by_type: Dict[str, int] = {}
+    # Sum only what is configured now; rows for removed infras expire alone.
+    for infra in fetchers:
+        for acc_type, count in recorded.get(infra, {}).items():
+            gpus_by_type[acc_type] = gpus_by_type.get(acc_type, 0) + count
+    return gpus_by_type
+
+
+def _collect_infra_count(
+        k8s_contexts: Optional[Collection[Any]],
+        ssh_contexts: Optional[Collection[Any]],
+        slurm_clusters: Optional[Collection[Any]]) -> Dict[str, int]:
+    """Count how many infrastructures of each kind the server manages.
+
+    Counts what the server is *configured* to use, not what is in use.
+    ``clouds`` excludes the three kinds counted separately. A lookup that
+    failed (None) leaves its key out rather than reporting zero.
+    """
+
+    def _enabled_clouds() -> Set[str]:
+        # Enabled clouds are cached per workspace, so union across all.
+        workspaces = skypilot_config.get_nested(('workspaces',),
+                                                default_value={})
+        names = set(workspaces) | {skylet_constants.SKYPILOT_DEFAULT_WORKSPACE}
+        separately_counted = (sky_clouds.Kubernetes, sky_clouds.SSH,
+                              sky_clouds.Slurm)
+        enabled: Set[str] = set()
+        for workspace in names:
+            for cloud in global_user_state.get_cached_enabled_clouds(
+                    cloud_lib.CloudCapability.COMPUTE, workspace):
+                if not isinstance(cloud, separately_counted):
+                    enabled.add(cloud.canonical_name())
+        return enabled
+
+    infra_count: Dict[str, int] = {}
+    for key, resolved in (('kubernetes', k8s_contexts),
+                          ('ssh_node_pools', ssh_contexts), ('slurm',
+                                                             slurm_clusters),
+                          ('clouds', _try_list('clouds', _enabled_clouds))):
+        if resolved is not None:
+            infra_count[key] = len(resolved)
+    return infra_count
 
 
 def maybe_show_privacy_policy():
@@ -575,6 +1057,90 @@ def maybe_show_privacy_policy():
             pass
 
 
+# Scarf (https://scarf.sh) analytics: complements the Loki-based usage
+# collection above with a fire-and-forget ping that carries only the
+# entrypoint name and the SkyPilot version (no PII). Scarf attributes
+# usage by source IP, so the ping must originate from the client side:
+# a ping sent from a centralized API server deployment would collapse
+# all of its users into a single origin. Server-side processes are
+# therefore excluded via ENV_VAR_IS_SKYPILOT_SERVER.
+_SCARF_TIMEOUT_SECONDS = 1
+# Entrypoints already pinged by this process. Each entrypoint is only
+# reported once per process, so long-running SDK programs (e.g. calling
+# status() in a loop) do not send a request per call.
+_scarf_pinged_entrypoints: Set[str] = set()
+
+
+def _scarf_opted_out() -> bool:
+    if env_options.Options.DISABLE_LOGGING.get():
+        return True
+    # DO_NOT_TRACK and SCARF_NO_ANALYTICS are industry-standard opt-outs:
+    # any value other than unset, empty or '0' opts out.
+    for env_var in ('DO_NOT_TRACK', 'SCARF_NO_ANALYTICS'):
+        if os.environ.get(env_var, '0') not in ('', '0'):
+            return True
+    return False
+
+
+def _send_scarf_ping(params: Dict[str, str]) -> None:
+    try:
+        url = (constants.SCARF_GATEWAY_URL + '?' +
+               urllib.parse.urlencode(params))
+        with urllib.request.urlopen(url, timeout=_SCARF_TIMEOUT_SECONDS):
+            pass
+    except Exception:  # pylint: disable=broad-except
+        # Analytics must never break a command.
+        pass
+
+
+def _maybe_start_scarf_ping(entrypoint_name: str,
+                            internal: bool) -> Optional[threading.Thread]:
+    """Starts a background thread sending the Scarf ping for an entrypoint.
+
+    Returns the started thread, or None when the ping is skipped: on the
+    API server, for internal (controller-initiated) operations, for
+    operations marked via skip_scarf_ping_for_current_operation() (e.g.
+    dryrun), when the user opted out, or when this entrypoint was already
+    reported by this process.
+
+    Args:
+        entrypoint_name: the entrypoint to report.
+        internal: whether the operation was initiated by sky internal code.
+            Callers should pass the ``internal`` flag captured at entrypoint
+            entry: set_internal() calls made by nested sub-operations during
+            the entrypoint body (e.g. the implicit jobs queue query in
+            ``sky status``) do not make the entrypoint itself internal.
+    """
+    try:
+        if _scarf_opted_out():
+            return None
+        if os.environ.get(skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER):
+            return None
+        if internal or messages.usage.scarf_ping_skipped():
+            return None
+        if entrypoint_name in _scarf_pinged_entrypoints:
+            return None
+        _scarf_pinged_entrypoints.add(entrypoint_name)
+        params = {'command': entrypoint_name, 'version': sky.__version__}
+        thread = threading.Thread(target=_send_scarf_ping,
+                                  args=(params,),
+                                  daemon=True)
+        thread.start()
+        return thread
+    except Exception:  # pylint: disable=broad-except
+        # Analytics must never break a command.
+        return None
+
+
+def skip_scarf_ping_for_current_operation() -> None:
+    """Skips the Scarf analytics ping for the current entrypoint.
+
+    Used for invocations that do not reflect actual usage, e.g. dryrun or
+    launches initiated by SkyPilot controllers rather than by users.
+    """
+    messages.usage.skip_scarf_ping()
+
+
 @contextlib.contextmanager
 def entrypoint_context(name: str, fallback: bool = False):
     """Context manager for entrypoint.
@@ -587,6 +1153,11 @@ def entrypoint_context(name: str, fallback: bool = False):
     the global entrypoint to catch any exceptions that are not caught.
     """
     is_entry = messages.usage.entrypoint is None
+    # Capture the internal flag at entry for the Scarf ping decision:
+    # controllers call set_internal() before invoking an entrypoint, while
+    # set_internal() calls during the body come from nested sub-operations
+    # and do not make this entrypoint internal.
+    internal_at_entry = messages.usage.internal
     if is_entry and not fallback:
         for message in messages.values():
             message.start()
@@ -602,9 +1173,18 @@ def entrypoint_context(name: str, fallback: bool = False):
         store_exception(e)
         raise
     finally:
+        # Start the Scarf ping before the (blocking) Loki send below so the
+        # two requests overlap, then bound the extra wait for the ping.
+        # Fallback contexts do not ping: the actual entrypoint, if any,
+        # already pinged with a more precise name.
+        scarf_thread = None
         if fallback:
             messages.usage.update_entrypoint(name)
+        else:
+            scarf_thread = _maybe_start_scarf_ping(name, internal_at_entry)
         _send_local_messages()
+        if scarf_thread is not None:
+            scarf_thread.join(timeout=_SCARF_TIMEOUT_SECONDS)
 
 
 T = typing.TypeVar('T')
