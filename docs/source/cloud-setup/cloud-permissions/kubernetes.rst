@@ -139,6 +139,31 @@ Permissions for ``sky gpus list``
     If this role is not granted to the service account, ``sky gpus list`` will still work but it will only show the total GPUs on the nodes, not the number of free GPUs.
 
 
+Permissions for GPU metrics
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If the API server federates :ref:`GPU metrics <api-server-gpu-metrics-setup>` from this cluster, the credentials used in the kubeconfig context should also be able to ``get`` the ``kube-system`` namespace. Service accounts created with ``generate_kubeconfig.sh`` and API servers deployed with the Helm chart already include this permission; if you manage permissions manually, add:
+
+.. code-block:: yaml
+
+    # Required only if the API server federates GPU metrics from this cluster.
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+        name: sky-sa-cluster-role-namespace-reader
+    rules:
+      - apiGroups: [""]
+        resources: ["namespaces"]
+        resourceNames: ["kube-system"]
+        verbs: ["get"]
+
+SkyPilot uses this to detect whether a kubeconfig context points back at the cluster the API server itself runs in (by reading the UID of the ``kube-system`` namespace, the de-facto cluster identity, and comparing it with the UID seen through the in-cluster credentials), which is required to avoid a metrics self-federation loop.
+
+.. tip::
+
+    If this permission is not granted, GPU metrics for remote clusters still work; only a context that points back at the API server's own cluster would be misdetected as remote. The local cluster can always be referenced via the ``in-cluster`` context instead, which does not need this permission.
+
+
 Permissions for object store mounting
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -240,6 +265,11 @@ following role and configure SkyPilot to use it via
       - apiGroups: ["apps"]
         resources: ["deployments"]
         verbs: ["get", "list"]
+      # Required for emitting a breadcrumb event when the cluster autodowns
+      # itself, which the API server reads back to record the autostop.
+      - apiGroups: [""]
+        resources: ["events"]
+        verbs: ["create"]
 
 To use a custom workload service account, create the service account and role
 above, then set the following in :ref:`~/.sky/config.yaml <config-yaml>`:
@@ -257,6 +287,21 @@ above, then set the following in :ref:`~/.sky/config.yaml <config-yaml>`:
     ``sky`` commands inside the pod), the workload service account will need
     broader permissions similar to the `Minimum Permissions Required for SkyPilot`_.
 
+
+Controller clusters use a separate service account
+--------------------------------------------------
+
+A jobs or serve controller running as its own cluster provisions the clusters it
+launches, so its pod needs cluster-scoped permissions no pod running user code
+should hold. SkyPilot gives those clusters a separate account,
+``skypilot-controller-service-account``, and leaves
+``skypilot-service-account`` to workload pods. Under
+:ref:`consolidation mode <jobs-consolidation-mode>` the controllers
+run inside the API server and no pod holds these permissions at all.
+
+If you set ``remote_identity`` to a service account of your own, SkyPilot
+creates and reconciles nothing — you own that account's permissions for
+controllers and workloads alike.
 
 .. _k8s-sa-example:
 
