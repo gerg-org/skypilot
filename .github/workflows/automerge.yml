@@ -9,9 +9,7 @@ on:
 
 jobs:
   automerge:
-    runs-on: 
-    - self-hosted
-    - retort-runner
+    runs-on: retort-runner
     container: docker.io/gergorg/node:current-alpine3.16 # # necessary for running ARC with k8s jobs
     steps:  
 
